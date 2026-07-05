@@ -1,28 +1,602 @@
 // Frame Plucker
-// Uses ffmpeg only
-// 1. Select/import a file-backed video in AE.
-// 2. Run this script.
-// 3. The script asks ffmpeg to measure adjacent-frame differences from the
+// Uses ffmpeg to remove repeated held frames from file-backed video in After Effects.
 
 (function () {
-  var DEFAULT_FPS = 24;
-  var DEFAULT_PERIOD = 24;
-  var DEFAULT_SCAN_FRAMES = 100;
-  var DEFAULT_SEARCH_FRAMES = 240;
-  var DEFAULT_MAX_PHASES = 6;
-  var DEFAULT_FFMPEG = findDefaultFfmpegPath();
+  var HARD_CAP = 1500;
+  var SETTINGS_SECTION = "FramePlucker";
+  var SETTINGS_FFMPEG_PATH = "ffmpegPath";
+
+// === CORE BEGIN ===
+  var MIN_PHASE_SAMPLES = 6;
+  var PERIOD_MIN = 2;
+  var PERIOD_MAX = 32;
+  var MAX_PHASES = 8;
+  // Adjusted from 0.05 to 0.04: stutter-23in24 has one duplicate per 24 frames,
+  // so the 5th percentile lands in the motion class and prevents separation.
+  var NOISE_FLOOR_PERCENTILE = 0.04;
+  var NOISE_FLOOR_SAMPLES = 5;
+  // Adjusted from 3 to 5: stutter-16in24 missed the required 90% duplicate-candidate
+  // coverage because several codec-noisy duplicate samples landed between floor*3 and floor*5.
+  var DUP_FLOOR_MULTIPLIER = 5;
+  var DUP_FLOOR_OFFSET = 0.02;
+  var COMB_SCORE_GATE = 0.6;
+  var HARMONIC_TOLERANCE = 0.05;
+  var PHASE_DUP_RATE = 0.8;
+  var MAX_RESIDUAL_DUP = 0.10;
+  var DRIFT_MIN_DUPS = 12;
+  var DRIFT_MAX_RUN = 2;
+  var DRIFT_MIN_GAP = 2;
+  var DRIFT_MAX_GAP = 12;
+  var DRIFT_GAP_REGULARITY = 0.6;
+  var SCATTER_MIN_DUPS = 2;
+  var SCATTER_MAX_FRACTION = 0.2;
+  var SCATTER_GAP_RATIO = 3;
+  // A 4fps-in-24 cadence creates runs of 5 duplicates and remains cadence evidence;
+  // runs of 6+ are treated as freeze holds, so lower content rates are out of scope.
+  var FREEZE_MIN_RUN = 6;
+  function shellQuote(value, isWin) {
+    var text = String(value);
+    if (isWin) {
+      return "\"" + text.replace(/"/g, "\"\"") + "\"";
+    }
+    var quoted = text.replace(/(["\\$])/g, "\\$1");
+    var tick = String.fromCharCode(96);
+    return "\"" + quoted.replace(new RegExp(tick, "g"), "\\" + tick) + "\"";
+  }
+  function parseDiffMetrics(output) {
+    var lines = String(output).split(/\r\n|\r|\n/);
+    var metrics = [];
+    var currentFrame = null;
+
+    for (var i = 0; i < lines.length; i++) {
+      var frameMatch = lines[i].match(/frame:\s*(\d+)/);
+      if (frameMatch) {
+        currentFrame = parseInt(frameMatch[1], 10);
+        continue;
+      }
+      var valueMatch = lines[i].match(/lavfi\.signalstats\.YAVG=([0-9.]+)/);
+      if (valueMatch && currentFrame !== null) {
+        metrics.push({ frame: currentFrame, value: parseFloat(valueMatch[1]) });
+        currentFrame = null;
+      }
+    }
+    return metrics;
+  }
+  function lastNonEmptyLines(text, count) {
+    var lines = String(text).split(/\r\n|\r|\n/);
+    var kept = [];
+    for (var i = lines.length - 1; i >= 0 && kept.length < count; i--) {
+      if (String(lines[i]).replace(/\s/g, "") !== "") kept.unshift(lines[i]);
+    }
+    return kept.join("\n");
+  }
+  function resolveSourceSelection(candidates) {
+    if (!candidates.length) return { error: "none" };
+
+    for (var rule = 1; rule <= 4; rule++) {
+      var firstIndex = -1;
+      var ids = {};
+      var distinct = 0;
+      for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i].rule === rule) {
+          if (firstIndex < 0) firstIndex = i;
+          var id = String(candidates[i].id);
+          if (!ids[id]) {
+            ids[id] = true;
+            distinct++;
+          }
+        }
+      }
+      if (firstIndex >= 0) {
+        if (distinct === 1) return { index: firstIndex };
+        return { error: "multiple" };
+      }
+    }
+
+    return { error: "none" };
+  }
+  function percentile(values, p) {
+    if (!values.length) return 0;
+    var sorted = values.slice(0).sort(function (a, b) { return a - b; });
+    var index = Math.floor((sorted.length - 1) * p);
+    if (index < 0) index = 0;
+    if (index >= sorted.length) index = sorted.length - 1;
+    return sorted[index];
+  }
+  function median(values) {
+    return percentile(values, 0.5);
+  }
+  function getMetricValues(metrics) {
+    var values = [];
+    for (var i = 0; i < metrics.length; i++) values.push(metrics[i].value);
+    return values;
+  }
+  function estimateNoiseFloor(values) {
+    return percentile(values, NOISE_FLOOR_PERCENTILE);
+  }
+  function estimateSmallestMedianNoiseFloor(values) {
+    if (!values.length) return 0;
+    var sorted = values.slice(0).sort(function (a, b) { return a - b; });
+    var count = Math.min(NOISE_FLOOR_SAMPLES, sorted.length);
+    var smallest = [];
+    for (var i = 0; i < count; i++) smallest.push(sorted[i]);
+    return median(smallest);
+  }
+  function duplicateCutoff(floor) {
+    return Math.max(floor * DUP_FLOOR_MULTIPLIER, floor + DUP_FLOOR_OFFSET);
+  }
+  function analyzeDuplicateClassWithFloor(metrics, floor) {
+    var cutoff = duplicateCutoff(floor);
+    var dupValues = [];
+    var motionValues = [];
+    for (var i = 0; i < metrics.length; i++) {
+      if (metrics[i].value <= cutoff) dupValues.push(metrics[i].value);
+      else motionValues.push(metrics[i].value);
+    }
+    var dupMedian = dupValues.length ? median(dupValues) : 0;
+    var motionMedian = motionValues.length ? median(motionValues) : 0;
+    var separable = dupValues.length > 0 &&
+      motionValues.length > 0 &&
+      dupMedian <= 0.25 * motionMedian &&
+      motionMedian >= floor + 0.05;
+    return { floor: floor, cutoff: cutoff, dupMedian: dupMedian, motionMedian: motionMedian, dupCount: dupValues.length, motionCount: motionValues.length, separable: separable };
+  }
+  function analyzeDuplicateClass(metrics) {
+    var values = getMetricValues(metrics);
+    var percentileFloor = estimateNoiseFloor(values);
+    var percentileAnalysis = analyzeDuplicateClassWithFloor(metrics, percentileFloor);
+    if (percentileAnalysis.separable) return percentileAnalysis;
+
+    var smallestMedianFloor = estimateSmallestMedianNoiseFloor(values);
+    if (smallestMedianFloor !== percentileFloor) {
+      var smallestMedianAnalysis = analyzeDuplicateClassWithFloor(metrics, smallestMedianFloor);
+      if (smallestMedianAnalysis.separable) return smallestMedianAnalysis;
+    }
+
+    return percentileAnalysis;
+  }
+  function isDuplicateMetric(metric, analysis) {
+    return metric.value <= analysis.cutoff;
+  }
+  function splitFreezeSpans(metrics, analysis) {
+    var working = [];
+    var freezes = [];
+    var runStartIndex = -1;
+    var runLength = 0;
+
+    function flushRun() {
+      if (runLength >= FREEZE_MIN_RUN && analysis.floor > 0) {
+        freezes.push({ start: metrics[runStartIndex].frame, length: runLength });
+      } else {
+        for (var runIndex = 0; runIndex < runLength; runIndex++) {
+          working.push(metrics[runStartIndex + runIndex]);
+        }
+      }
+      runStartIndex = -1;
+      runLength = 0;
+    }
+
+    for (var i = 0; i < metrics.length; i++) {
+      if (isDuplicateMetric(metrics[i], analysis)) {
+        if (runLength > 0 && metrics[i].frame === metrics[i - 1].frame + 1) {
+          runLength++;
+        } else {
+          if (runLength > 0) flushRun();
+          runStartIndex = i;
+          runLength = 1;
+        }
+      } else {
+        if (runLength > 0) flushRun();
+        working.push(metrics[i]);
+      }
+    }
+    if (runLength > 0) flushRun();
+
+    return { working: working, freezes: freezes };
+  }
+  function phaseDupRates(metrics, period, analysis) {
+    var counts = [];
+    var dupCounts = [];
+    var rates = [];
+    for (var p = 0; p < period; p++) {
+      counts[p] = 0;
+      dupCounts[p] = 0;
+    }
+    for (var i = 0; i < metrics.length; i++) {
+      var phase = ((metrics[i].frame % period) + period) % period;
+      counts[phase]++;
+      if (isDuplicateMetric(metrics[i], analysis)) dupCounts[phase]++;
+    }
+    for (var phaseIndex = 0; phaseIndex < period; phaseIndex++) {
+      if (counts[phaseIndex] >= MIN_PHASE_SAMPLES) {
+        rates[phaseIndex] = dupCounts[phaseIndex] / counts[phaseIndex];
+      } else {
+        rates[phaseIndex] = null;
+      }
+    }
+    return { counts: counts, dupCounts: dupCounts, rates: rates };
+  }
+  function combScoreForPeriod(metrics, period, analysis) {
+    var phaseStats = phaseDupRates(metrics, period, analysis);
+    var valid = 0;
+    var minDupRate = 2;
+    var maxRestRate = -1;
+    var firstDupPhase = -1;
+    for (var phase = 0; phase < period; phase++) {
+      var rate = phaseStats.rates[phase];
+      if (rate !== null) {
+        valid++;
+        if (rate >= PHASE_DUP_RATE) {
+          if (rate < minDupRate) minDupRate = rate;
+          if (firstDupPhase < 0) firstDupPhase = phase;
+        } else {
+          if (rate > maxRestRate) maxRestRate = rate;
+        }
+      }
+    }
+    if (valid < 2 || firstDupPhase < 0 || maxRestRate < 0) {
+      return { period: period, score: -1, maxPhase: -1 };
+    }
+    return { period: period, score: minDupRate - maxRestRate, maxPhase: firstDupPhase };
+  }
+
+  function detectPeriodWithAnalysis(metrics, analysis) {
+    if (!analysis.separable) {
+      return { hasPeriod: false, analysis: analysis, reason: "not_separable" };
+    }
+
+    var scores = [];
+    var best = null;
+    for (var period = PERIOD_MIN; period <= PERIOD_MAX; period++) {
+      var scored = combScoreForPeriod(metrics, period, analysis);
+      scores.push(scored);
+      if (!best || scored.score > best.score) best = scored;
+    }
+
+    if (!best || best.score < COMB_SCORE_GATE) {
+      return { hasPeriod: false, analysis: analysis, scores: scores, best: best, reason: "weak_period" };
+    }
+
+    for (var divisor = PERIOD_MIN; divisor < best.period; divisor++) {
+      if (best.period % divisor === 0) {
+        var divisorScore = null;
+        for (var scoreIndex = 0; scoreIndex < scores.length; scoreIndex++) {
+          if (scores[scoreIndex].period === divisor) {
+            divisorScore = scores[scoreIndex];
+            break;
+          }
+        }
+        if (divisorScore && divisorScore.score >= best.score - HARMONIC_TOLERANCE) {
+          best = divisorScore;
+          break;
+        }
+      }
+    }
+
+    return { hasPeriod: true, period: best.period, score: best.score, analysis: analysis, scores: scores };
+  }
+  function detectPeriod(metrics) {
+    return detectPeriodWithAnalysis(metrics, analyzeDuplicateClass(metrics));
+  }
+
+  function selectPhasesForPeriod(metrics, period, analysis, maxPhases) {
+    var phaseStats = phaseDupRates(metrics, period, analysis);
+    var selected = [];
+
+    for (var phaseIndex = 0; phaseIndex < period; phaseIndex++) {
+      if (phaseStats.rates[phaseIndex] !== null && phaseStats.rates[phaseIndex] >= PHASE_DUP_RATE) {
+        selected.push(phaseIndex);
+      }
+    }
+
+    selected.sort(function (a, b) { return a - b; });
+    return selected;
+  }
+
+  function sliceMetricsByFrame(metrics, startFrame, endFrame) {
+    var sliced = [];
+    for (var i = 0; i < metrics.length; i++) {
+      if (metrics[i].frame >= startFrame && metrics[i].frame < endFrame) sliced.push(metrics[i]);
+    }
+    return sliced;
+  }
+
+  function countMotionMetrics(metrics, analysis) {
+    var count = 0;
+    for (var i = 0; i < metrics.length; i++) {
+      if (!isDuplicateMetric(metrics[i], analysis)) count++;
+    }
+    return count;
+  }
+
+  function samePhaseSet(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  function intersectPhaseSets(a, b) {
+    var result = [];
+    for (var i = 0; i < a.length; i++) {
+      for (var j = 0; j < b.length; j++) {
+        if (a[i] === b[j]) {
+          result.push(a[i]);
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
+  function residualDuplicateRate(metrics, period, analysis, phases) {
+    var dupTotal = 0;
+    var residual = 0;
+    for (var i = 0; i < metrics.length; i++) {
+      if (isDuplicateMetric(metrics[i], analysis)) {
+        var phase = ((metrics[i].frame % period) + period) % period;
+        dupTotal++;
+        if (!phaseListContains(phases, phase)) residual++;
+      }
+    }
+    return dupTotal ? residual / dupTotal : 0;
+  }
+
+  function crossSectionConfidence(metrics, period, analysis, phases, maxPhases) {
+    if (!phases.length || !metrics.length) {
+      return { confidence: "none", phases: [] };
+    }
+
+    var firstFrame = metrics[0].frame;
+    var lastFrame = metrics[metrics.length - 1].frame + 1;
+    var span = Math.max(1, lastFrame - firstFrame);
+    var sections = Math.floor(metrics.length / (period * MIN_PHASE_SAMPLES));
+    if (sections < 1) sections = 1;
+    if (sections > 3) sections = 3;
+    var evaluated = [];
+
+    for (var section = 0; section < sections; section++) {
+      var start = firstFrame + Math.floor(span * section / sections);
+      var end = section === sections - 1 ? lastFrame : firstFrame + Math.floor(span * (section + 1) / sections);
+      var sectionMetrics = sliceMetricsByFrame(metrics, start, end);
+      if (countMotionMetrics(sectionMetrics, analysis) < 2 * period) continue;
+      var sectionPhases = selectPhasesForPeriod(sectionMetrics, period, analysis, maxPhases);
+      if (sectionPhases.length) evaluated.push(sectionPhases);
+    }
+
+    if (!evaluated.length) {
+      return { confidence: "none", phases: [] };
+    }
+
+    var allSame = true;
+    for (var i = 0; i < evaluated.length; i++) {
+      if (!samePhaseSet(evaluated[i], phases)) allSame = false;
+    }
+    if (allSame && evaluated.length >= 2) {
+      return { confidence: "high", phases: phases };
+    }
+    if (allSame) return { confidence: "medium", phases: phases };
+
+    var intersection = phases.slice(0);
+    for (var j = 0; j < evaluated.length; j++) {
+      intersection = intersectPhaseSets(intersection, evaluated[j]);
+    }
+    if (intersection.length) {
+      return { confidence: "medium", phases: intersection };
+    }
+
+    return { confidence: "none", phases: [] };
+  }
+
+  function collectDuplicateFrames(metrics, analysis) {
+    var frames = [];
+    for (var i = 0; i < metrics.length; i++) {
+      if (isDuplicateMetric(metrics[i], analysis)) frames.push(metrics[i].frame);
+    }
+    return frames;
+  }
+
+  function duplicateGaps(dupFrames) {
+    var gaps = [];
+    for (var i = 1; i < dupFrames.length; i++) gaps.push(dupFrames[i] - dupFrames[i - 1]);
+    return gaps;
+  }
+
+  function maxConsecutiveDuplicateRun(dupFrames) {
+    if (!dupFrames.length) return 0;
+    var maxRun = 1;
+    var run = 1;
+    for (var i = 1; i < dupFrames.length; i++) {
+      if (dupFrames[i] === dupFrames[i - 1] + 1) {
+        run++;
+        if (run > maxRun) maxRun = run;
+      } else {
+        run = 1;
+      }
+    }
+    return maxRun;
+  }
+
+  function detectDriftCadence(metrics, analysis) {
+    var dupFrames = collectDuplicateFrames(metrics, analysis);
+    if (dupFrames.length < DRIFT_MIN_DUPS) return { hasCadence: false, reason: "drift_too_few_duplicates", dupFrames: dupFrames };
+    if (maxConsecutiveDuplicateRun(dupFrames) > DRIFT_MAX_RUN) return { hasCadence: false, reason: "drift_duplicate_run", dupFrames: dupFrames };
+
+    var gaps = duplicateGaps(dupFrames);
+    if (!gaps.length) return { hasCadence: false, reason: "drift_too_few_gaps", dupFrames: dupFrames };
+    var medianGap = median(gaps);
+    if (medianGap < DRIFT_MIN_GAP || medianGap > DRIFT_MAX_GAP) return { hasCadence: false, reason: "drift_gap_out_of_range", dupFrames: dupFrames, medianGap: medianGap };
+
+    var regular = 0;
+    for (var i = 0; i < gaps.length; i++) {
+      if (gaps[i] >= medianGap - 1 && gaps[i] <= medianGap + 1) regular++;
+    }
+    if (regular / gaps.length < DRIFT_GAP_REGULARITY) return { hasCadence: false, reason: "drift_irregular_gaps", dupFrames: dupFrames, medianGap: medianGap };
+
+    return { hasCadence: true, mode: "drift", dupFrames: dupFrames, medianGap: medianGap, confidence: "medium", analysis: analysis };
+  }
+
+  function scatteredClassExtremes(metrics, analysis) {
+    var maxDup = null;
+    var minMotion = null;
+    for (var i = 0; i < metrics.length; i++) {
+      if (isDuplicateMetric(metrics[i], analysis)) {
+        if (maxDup === null || metrics[i].value > maxDup) maxDup = metrics[i].value;
+      } else {
+        if (minMotion === null || metrics[i].value < minMotion) minMotion = metrics[i].value;
+      }
+    }
+    return { maxDup: maxDup, minMotion: minMotion };
+  }
+
+  function detectScatteredCadence(metrics, analysis) {
+    var dupFrames = collectDuplicateFrames(metrics, analysis);
+    if (dupFrames.length < SCATTER_MIN_DUPS) return { hasCadence: false, reason: "scatter_too_few_duplicates", dupFrames: dupFrames };
+    if (dupFrames.length > SCATTER_MAX_FRACTION * metrics.length) return { hasCadence: false, reason: "scatter_too_many_duplicates", dupFrames: dupFrames };
+    if (maxConsecutiveDuplicateRun(dupFrames) > DRIFT_MAX_RUN) return { hasCadence: false, reason: "scatter_duplicate_run", dupFrames: dupFrames };
+
+    var extremes = scatteredClassExtremes(metrics, analysis);
+    if (extremes.maxDup === null || extremes.minMotion === null || extremes.minMotion < SCATTER_GAP_RATIO * extremes.maxDup) {
+      return { hasCadence: false, reason: "scatter_not_detached", dupFrames: dupFrames, extremes: extremes };
+    }
+
+    return { hasCadence: true, mode: "scattered", dupFrames: dupFrames, confidence: "medium", analysis: analysis };
+  }
+
+  function detectLockedCadence(metrics, maxPhases, periodOverride, analysis) {
+    var periodResult;
+    if (periodOverride) {
+      periodResult = { hasPeriod: analysis.separable, period: periodOverride, score: null, analysis: analysis, reason: analysis.separable ? "" : "not_separable" };
+    } else {
+      periodResult = detectPeriodWithAnalysis(metrics, analysis);
+    }
+
+    if (!periodResult.hasPeriod) {
+      return { hasCadence: false, reason: periodResult.reason, analysis: periodResult.analysis, periodResult: periodResult };
+    }
+
+    var phases = selectPhasesForPeriod(metrics, periodResult.period, periodResult.analysis, maxPhases);
+    if (maxPhases && phases.length > maxPhases) {
+      return { hasCadence: false, reason: "too_many_phases", analysis: periodResult.analysis, periodResult: periodResult, phases: phases };
+    }
+    if (residualDuplicateRate(metrics, periodResult.period, periodResult.analysis, phases) > MAX_RESIDUAL_DUP) {
+      return { hasCadence: false, reason: "residual_duplicates", analysis: periodResult.analysis, periodResult: periodResult, phases: phases };
+    }
+    var sectionResult = crossSectionConfidence(metrics, periodResult.period, periodResult.analysis, phases, maxPhases);
+    if (sectionResult.confidence === "none") {
+      return { hasCadence: false, reason: "section_disagreement", analysis: periodResult.analysis, periodResult: periodResult, phases: phases };
+    }
+
+    return { hasCadence: true, mode: "locked", period: periodResult.period, phases: sectionResult.phases, confidence: sectionResult.confidence, score: periodResult.score, analysis: periodResult.analysis };
+  }
+
+  function addFreezes(result, freezes) {
+    result.freezes = freezes;
+    return result;
+  }
+
+  function detectCadence(metrics, maxPhases, periodOverride) {
+    var analysis = analyzeDuplicateClass(metrics);
+    if (!analysis.separable) {
+      return { hasCadence: false, reason: "not_separable", analysis: analysis, freezes: [] };
+    }
+
+    var split = splitFreezeSpans(metrics, analysis);
+    var workingDupFrames = collectDuplicateFrames(split.working, analysis);
+    if (split.freezes.length && workingDupFrames.length < 2 * PERIOD_MIN) {
+      return { hasCadence: false, reason: "freeze_only", analysis: analysis, freezes: split.freezes };
+    }
+
+    var lockedResult = detectLockedCadence(split.working, maxPhases, periodOverride, analysis);
+    if (lockedResult.hasCadence || lockedResult.reason === "not_separable") return addFreezes(lockedResult, split.freezes);
+
+    var driftResult = detectDriftCadence(split.working, lockedResult.analysis);
+    if (driftResult.hasCadence) return addFreezes(driftResult, split.freezes);
+
+    var scatterResult = detectScatteredCadence(split.working, lockedResult.analysis);
+    if (scatterResult.hasCadence) return addFreezes(scatterResult, split.freezes);
+
+    return addFreezes(lockedResult, split.freezes);
+  }
+
+  function phaseListContains(phases, phase) {
+    for (var i = 0; i < phases.length; i++) {
+      if (phases[i] === phase) return true;
+    }
+    return false;
+  }
+
+  function buildKeepFrames(frameCount, period, phases, srcStartFrame) {
+    var keepFrames = [];
+    var startFrame = srcStartFrame || 0;
+    for (var frame = 0; frame < frameCount; frame++) {
+      var sourcePhase = (((startFrame + frame) % period) + period) % period;
+      if (!phaseListContains(phases, sourcePhase)) keepFrames.push(frame);
+    }
+    return keepFrames;
+  }
+  function buildKeepFramesFromDupList(frameCount, dupFrames, srcStartFrame) {
+    var keepFrames = [];
+    var startFrame = srcStartFrame || 0;
+    var dupLookup = {};
+    for (var i = 0; i < dupFrames.length; i++) dupLookup[dupFrames[i]] = true;
+    for (var frame = 0; frame < frameCount; frame++) {
+      if (!dupLookup[startFrame + frame]) keepFrames.push(frame);
+    }
+    return keepFrames;
+  }
+// === CORE END ===
 
   function fail(message) {
-    alert(message);
+    alert(message, "Frame Plucker");
     throw new Error(message);
   }
 
+  function lowerText(value) {
+    return String(value).toLowerCase();
+  }
+
   function isMac() {
-    return String($.os).toLowerCase().indexOf("mac") >= 0;
+    return lowerText($.os).match(/mac/) !== null;
   }
 
   function isWindows() {
-    return String($.os).toLowerCase().indexOf("windows") >= 0;
+    return lowerText($.os).match(/windows/) !== null;
+  }
+
+  function aeShellQuote(value) {
+    return shellQuote(value, isWindows());
+  }
+
+  function getCachedFfmpegPath() {
+    try {
+      if (app.settings.haveSetting(SETTINGS_SECTION, SETTINGS_FFMPEG_PATH)) {
+        return app.settings.getSetting(SETTINGS_SECTION, SETTINGS_FFMPEG_PATH);
+      }
+    } catch (err) {}
+    return "";
+  }
+
+  function saveCachedFfmpegPath(path) {
+    try {
+      app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_FFMPEG_PATH, String(path));
+    } catch (err) {}
+  }
+
+  function clearCachedFfmpegPath() {
+    try {
+      app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_FFMPEG_PATH, "");
+    } catch (err) {}
+  }
+
+  function commandWorks(command) {
+    try {
+      var output = system.callSystem(aeShellQuote(command) + " -version");
+      return lowerText(output).match(/ffmpeg version/) !== null;
+    } catch (err) {
+      return false;
+    }
   }
 
   function findDefaultFfmpegPath() {
@@ -44,444 +618,138 @@
     return "ffmpeg";
   }
 
-  function commandWorks(command) {
-    try {
-      var output = system.callSystem(shellQuote(command) + " -version");
-      return String(output).toLowerCase().indexOf("ffmpeg version") >= 0;
-    } catch (err) {
-      return false;
-    }
-  }
-
-  function shellQuote(value) {
-    var text = String(value);
-    if (isWindows()) {
-      return "\"" + text.replace(/"/g, "\\\"") + "\"";
-    }
-    return "\"" + text.replace(/(["\\$`])/g, "\\$1") + "\"";
+  function isNotFoundOutput(output) {
+    var text = lowerText(output);
+    return text.match(/not found/) !== null ||
+      text.match(/no such file/) !== null ||
+      text.match(/not recognized/) !== null ||
+      text.match(/cannot find/) !== null;
   }
 
   function isFileBackedSource(item) {
     return item && item instanceof FootageItem && item.file && item.file.exists && item.width > 0 && item.height > 0;
   }
 
-  function sourceRefFromItem(item, priority) {
-    return {
-      source: item,
-      layer: null,
-      comp: null,
-      file: item.file,
-      name: item.name,
-      baseName: item.name,
-      width: item.width,
-      height: item.height,
-      pixelAspect: item.pixelAspect || 1,
-      bgColor: [0, 0, 0],
-      priority: priority || 0,
-      label: "Project: " + item.name
-    };
+  function sourceRefFromItem(item) {
+    return { source: item, layer: null, comp: null, file: item.file, name: item.name, baseName: item.name, width: item.width, height: item.height, pixelAspect: item.pixelAspect || 1, bgColor: [0, 0, 0] };
   }
 
-  function sourceRefFromLayer(layer, comp, priority) {
-    return {
-      source: layer.source,
-      layer: layer,
-      comp: comp,
-      file: layer.source.file,
-      name: layer.name,
-      baseName: comp.name,
-      width: comp.width,
-      height: comp.height,
-      pixelAspect: comp.pixelAspect || 1,
-      bgColor: comp.bgColor,
-      priority: priority || 0,
-      label: "Layer: " + layer.name
-    };
+  function sourceRefFromLayer(layer, comp) {
+    return { source: layer.source, layer: layer, comp: comp, file: layer.source.file, name: layer.name, baseName: comp.name, width: comp.width, height: comp.height, pixelAspect: comp.pixelAspect || 1, bgColor: comp.bgColor };
   }
 
-  function collectSourceRefs() {
+  function addSourceCandidate(candidates, refs, rule, id, ref) {
+    candidates.push({ id: id, rule: rule }); refs.push(ref);
+  }
+
+  function collectSourceCandidates() {
+    var candidates = [];
     var refs = [];
     var activeItem = app.project.activeItem;
     var selection = app.project.selection || [];
 
-    if (activeItem instanceof CompItem) {
-      for (var layerIndex = 1; layerIndex <= activeItem.numLayers; layerIndex++) {
-        var layer = activeItem.layer(layerIndex);
-        if (layer instanceof AVLayer && isFileBackedSource(layer.source)) {
-          refs.push(sourceRefFromLayer(layer, activeItem, 100));
-        }
+    for (var selectedIndex = 0; selectedIndex < selection.length; selectedIndex++) {
+      if (isFileBackedSource(selection[selectedIndex])) {
+        addSourceCandidate(candidates, refs, 1, String(selection[selectedIndex].id), sourceRefFromItem(selection[selectedIndex]));
       }
     }
 
-    for (var selectedIndex = 0; selectedIndex < selection.length; selectedIndex++) {
-      if (isFileBackedSource(selection[selectedIndex])) {
-        refs.push(sourceRefFromItem(selection[selectedIndex], 90));
+    if (activeItem instanceof CompItem) {
+      var selectedLayers = activeItem.selectedLayers || [];
+      for (var layerIndex = 0; layerIndex < selectedLayers.length; layerIndex++) {
+        var layer = selectedLayers[layerIndex];
+        if (layer instanceof AVLayer && isFileBackedSource(layer.source)) {
+          addSourceCandidate(candidates, refs, 2, String(layer.source.id) + ":" + layer.index, sourceRefFromLayer(layer, activeItem));
+        }
       }
     }
 
     if (isFileBackedSource(activeItem)) {
-      refs.push(sourceRefFromItem(activeItem, 80));
+      addSourceCandidate(candidates, refs, 3, String(activeItem.id), sourceRefFromItem(activeItem));
     }
 
+    var onlyFileBacked = null;
+    var fileBackedCount = 0;
     for (var itemIndex = 1; itemIndex <= app.project.numItems; itemIndex++) {
       var item = app.project.item(itemIndex);
       if (isFileBackedSource(item)) {
-        refs.push(sourceRefFromItem(item, 0));
+        onlyFileBacked = item;
+        fileBackedCount++;
       }
     }
+    if (fileBackedCount === 1) {
+      addSourceCandidate(candidates, refs, 4, String(onlyFileBacked.id), sourceRefFromItem(onlyFileBacked));
+    }
 
-    refs.sort(function (a, b) {
-      if (a.priority !== b.priority) return b.priority - a.priority;
-      return a.label.toLowerCase() < b.label.toLowerCase() ? -1 : 1;
-    });
-
-    return refs;
+    return { candidates: candidates, refs: refs };
   }
 
-  function chooseSettings() {
-    var refs = collectSourceRefs();
-    if (refs.length < 1) {
-      fail("Import a file-backed video or open a comp containing one before running this script.");
-    }
-
-    var FORM_WIDTH = 420;
-    var FIELD_WIDTH = 76;
-
-    function addSettingColumn(parent, label, value) {
-      var column = parent.add("group");
-      column.orientation = "column";
-      column.alignChildren = ["fill", "top"];
-      column.add("statictext", undefined, label);
-      var input = column.add("edittext", undefined, String(value));
-      input.preferredSize.width = FIELD_WIDTH;
-      return input;
-    }
-
-    var dialog = new Window("dialog", "Frame Plucker");
-    dialog.orientation = "column";
-    dialog.alignChildren = ["fill", "top"];
-
-    var sourceGroup = dialog.add("group");
-    sourceGroup.orientation = "column";
-    sourceGroup.alignChildren = ["fill", "top"];
-    sourceGroup.add("statictext", undefined, "Source");
-    var sourceDropdown = sourceGroup.add("dropdownlist", undefined, []);
-    for (var i = 0; i < refs.length; i++) sourceDropdown.add("item", refs[i].label);
-    sourceDropdown.selection = 0;
-    sourceDropdown.preferredSize.width = FORM_WIDTH;
-
-    var ffmpegGroup = dialog.add("group");
-    ffmpegGroup.orientation = "column";
-    ffmpegGroup.alignChildren = ["fill", "top"];
-    ffmpegGroup.add("statictext", undefined, "ffmpeg");
-    var ffmpegRow = ffmpegGroup.add("group");
-    ffmpegRow.orientation = "row";
-    ffmpegRow.alignChildren = ["left", "center"];
-    var ffmpegInput = ffmpegRow.add("edittext", undefined, DEFAULT_FFMPEG);
-    ffmpegInput.preferredSize.width = 316;
-    var browseButton = ffmpegRow.add("button", undefined, "Browse");
-    browseButton.preferredSize.width = 96;
-    browseButton.onClick = function () {
-      var file = File.openDialog("Choose ffmpeg executable");
-      if (file) ffmpegInput.text = file.fsName;
-    };
-
-    var settingsGroup = dialog.add("group");
-    settingsGroup.orientation = "row";
-    settingsGroup.alignChildren = ["left", "top"];
-    settingsGroup.spacing = 10;
-    var fpsInput = addSettingColumn(settingsGroup, "FPS", DEFAULT_FPS);
-    var periodInput = addSettingColumn(settingsGroup, "Period", DEFAULT_PERIOD);
-    var scanInput = addSettingColumn(settingsGroup, "Window", DEFAULT_SCAN_FRAMES);
-    var searchInput = addSettingColumn(settingsGroup, "Search", DEFAULT_SEARCH_FRAMES);
-    var maxPhasesInput = addSettingColumn(settingsGroup, "Max phases", DEFAULT_MAX_PHASES);
-
-    var buttons = dialog.add("group");
-    buttons.alignment = ["right", "top"];
-    buttons.add("button", undefined, "Cancel", { name: "cancel" });
-    buttons.add("button", undefined, "Pluck", { name: "ok" });
-
-    if (dialog.show() !== 1) return null;
-
-    var fps = parseFloat(fpsInput.text);
-    var period = parseInt(periodInput.text, 10);
-    var scanFrames = parseInt(scanInput.text, 10);
-    var searchFrames = parseInt(searchInput.text, 10);
-    var maxPhases = parseInt(maxPhasesInput.text, 10);
-    if (!isFinite(fps) || fps <= 0) fail("FPS must be a positive number.");
-    if (!isFinite(period) || period < 2) fail("Period must be 2 or higher.");
-    if (!isFinite(scanFrames) || scanFrames < period * 2) fail("Window must be at least two periods.");
-    if (!isFinite(searchFrames) || searchFrames < scanFrames) fail("Search must be at least the window length.");
-    if (!isFinite(maxPhases) || maxPhases < 1 || maxPhases > period) fail("Max phases must be between 1 and period.");
-
-    return {
-      sourceRef: refs[sourceDropdown.selection.index],
-      ffmpegPath: ffmpegInput.text,
-      fps: fps,
-      period: period,
-      scanFrames: scanFrames,
-      searchFrames: searchFrames,
-      maxPhases: maxPhases
-    };
+  function resolveSourceRef() {
+    var collected = collectSourceCandidates();
+    var resolved = resolveSourceSelection(collected.candidates);
+    if (resolved.error === "multiple") fail("Multiple videos selected - select a single video (or one layer) and run again.");
+    if (resolved.error === "none") fail("Select the footage to clean in the Project panel, or select its layer in a comp, then run again.");
+    return collected.refs[resolved.index];
   }
 
-  function runFfmpegDiffProbe(file, ffmpegPath, searchFrames) {
-    var filter = "select=lt(n\\," + searchFrames + "),scale=160:-1,tblend=all_mode=difference,signalstats,metadata=print:file=-:key=lavfi.signalstats.YAVG";
-    var command = shellQuote(ffmpegPath) +
-      " -hide_banner -v error -i " + shellQuote(file.fsName) +
-      " -vf " + shellQuote(filter) +
-      " -an -f null - 2>&1";
-
-    return system.callSystem(command);
+  function validateSourceRef(sourceRef) {
+    if (sourceRef.layer) {
+      if (Math.abs(sourceRef.layer.stretch - 100) > 0.01 || sourceRef.layer.timeRemapEnabled) fail("Stretched or time-remapped layers are not supported. Select the footage item in the Project panel instead.");
+    }
   }
 
-  function parseDiffMetrics(output) {
-    var lines = String(output).split(/\r\n|\r|\n/);
-    var metrics = [];
-    var currentFrame = null;
-
-    for (var i = 0; i < lines.length; i++) {
-      var frameMatch = lines[i].match(/frame:\s*(\d+)/);
-      if (frameMatch) {
-        currentFrame = parseInt(frameMatch[1], 10);
-        continue;
-      }
-
-      var valueMatch = lines[i].match(/lavfi\.signalstats\.YAVG=([0-9.]+)/);
-      if (valueMatch && currentFrame !== null) {
-        metrics.push({
-          frame: currentFrame,
-          value: parseFloat(valueMatch[1])
-        });
-        currentFrame = null;
-      }
-    }
-
-    return metrics;
+  function getSourceFrameRate(sourceRef) {
+    if (sourceRef.layer && sourceRef.comp) return sourceRef.comp.frameRate;
+    return sourceRef.source ? sourceRef.source.frameRate : 0;
   }
 
-  function percentile(values, p) {
-    if (!values.length) return 0;
-    var sorted = values.slice(0).sort(function (a, b) { return a - b; });
-    var index = Math.floor((sorted.length - 1) * p);
-    if (index < 0) index = 0;
-    if (index >= sorted.length) index = sorted.length - 1;
-    return sorted[index];
+  function getProbeFrameCount(sourceRef, fps) {
+    var duration = sourceRef.source && sourceRef.source.duration ? sourceRef.source.duration : 0;
+    var count = Math.round(duration * fps);
+    if (!isFinite(count) || count < 2) {
+      fail("Could not determine a usable source duration.");
+    }
+    return Math.min(count, HARD_CAP);
   }
 
-  function median(values) {
-    return percentile(values, 0.5);
-  }
-
-  function findLowThreshold(values) {
-    var sorted = values.slice(0).sort(function (a, b) { return a - b; });
-    var maxIndex = Math.max(1, Math.floor(sorted.length * 0.5));
-    var bestIndex = 0;
-    var bestGap = 0;
-
-    for (var i = 0; i < maxIndex && i < sorted.length - 1; i++) {
-      var gap = sorted[i + 1] - sorted[i];
-      if (gap > bestGap) {
-        bestGap = gap;
-        bestIndex = i;
-      }
-    }
-
-    if (bestGap > 0.000001) return sorted[bestIndex];
-    return percentile(values, 0.1);
-  }
-
-  function addUniquePhase(values, phase) {
-    for (var i = 0; i < values.length; i++) {
-      if (values[i] === phase) return;
-    }
-    values.push(phase);
-  }
-
-  function sliceMetrics(metrics, startFrame, endFrame) {
-    var sliced = [];
-    for (var i = 0; i < metrics.length; i++) {
-      if (metrics[i].frame >= startFrame && metrics[i].frame < endFrame) {
-        sliced.push(metrics[i]);
-      }
-    }
-    return sliced;
-  }
-
-  function getMetricValues(metrics) {
-    var values = [];
-    for (var i = 0; i < metrics.length; i++) values.push(metrics[i].value);
-    return values;
-  }
-
-  function scoreMetricWindow(metrics) {
-    if (metrics.length < 2) return -1;
-
-    var values = getMetricValues(metrics);
-    var p10 = percentile(values, 0.1);
-    var p50 = percentile(values, 0.5);
-    var p90 = percentile(values, 0.9);
-    var spread = p90 - p10;
-    var nearFlat = 0;
-
-    for (var i = 0; i < values.length; i++) {
-      if (values[i] <= 0.01) nearFlat++;
-    }
-
-    var flatRatio = nearFlat / values.length;
-    if (spread < 0.03 || p90 < 0.05 || flatRatio > 0.35) return -1;
-
-    return spread + p50 * 0.05;
-  }
-
-  function chooseDetectionWindow(metrics, period, scanFrames) {
-    if (metrics.length < period * 2 - 1) {
-      fail("ffmpeg returned too few frame metrics. Check the source and ffmpeg path.");
-    }
-
-    var windowMetricsTarget = Math.max(period * 2 - 1, scanFrames - 1);
-    if (metrics.length <= windowMetricsTarget) return metrics;
-
-    var best = null;
-    var step = Math.max(1, Math.floor(period / 2));
-    var latestStart = metrics[metrics.length - windowMetricsTarget].frame;
-
-    for (var start = 0; start <= latestStart; start += step) {
-      var windowMetrics = sliceMetrics(metrics, start, start + windowMetricsTarget);
-      if (windowMetrics.length < windowMetricsTarget) continue;
-
-      var score = scoreMetricWindow(windowMetrics);
-      if (!best || score > best.score) {
-        best = {
-          metrics: windowMetrics,
-          score: score
-        };
-      }
-    }
-
-    if (!best || best.score < 0) {
-      fail("The scanned section is too static for reliable auto-detection. Increase Search or mark phases manually.");
-    }
-
-    return best.metrics;
-  }
-
-  function detectPhases(metrics, period, maxPhases, scanFrames) {
-    var windowMetrics = chooseDetectionWindow(metrics, period, scanFrames);
-    var values = getMetricValues(windowMetrics);
-    var lowThreshold = findLowThreshold(values);
-    var groups = [];
-
-    for (var phase = 0; phase < period; phase++) {
-      var phaseValues = [];
-      var lowFrames = [];
-
-      for (var metricIndex = 0; metricIndex < windowMetrics.length; metricIndex++) {
-        var metric = windowMetrics[metricIndex];
-        var metricPhase = ((metric.frame % period) + period) % period;
-        if (metricPhase !== phase) continue;
-
-        phaseValues.push(metric.value);
-        if (metric.value <= lowThreshold) lowFrames.push(metric.frame);
-      }
-
-      if (phaseValues.length) {
-        groups.push({
-          phase: phase,
-          median: median(phaseValues),
-          hitRate: lowFrames.length / phaseValues.length,
-          lowCount: lowFrames.length,
-          lowFrames: lowFrames
-        });
-      }
-    }
-
-    groups.sort(function (a, b) {
-      if (a.lowCount !== b.lowCount) return b.lowCount - a.lowCount;
-      if (a.hitRate !== b.hitRate) return b.hitRate - a.hitRate;
-      if (a.median !== b.median) return a.median - b.median;
-      return a.phase - b.phase;
-    });
-
-    var selected = [];
-    var candidateCount = 0;
-    for (var groupIndex = 0; groupIndex < groups.length; groupIndex++) {
-      if (groups[groupIndex].lowCount >= 2 && groups[groupIndex].hitRate >= 0.5) {
-        candidateCount++;
-        if (selected.length < maxPhases) addUniquePhase(selected, groups[groupIndex].phase);
-      }
-    }
-
-    if (selected.length < 1) {
-      fail("No repeated low-motion phase was detected. This clip may not have a stable cadence in the first scanned frames.");
-    }
-
-    selected.sort(function (a, b) { return a - b; });
-
-    var averageHitRate = 0;
-    var selectedGroups = 0;
-    for (var selectedIndex = 0; selectedIndex < selected.length; selectedIndex++) {
-      for (var findIndex = 0; findIndex < groups.length; findIndex++) {
-        if (groups[findIndex].phase === selected[selectedIndex]) {
-          averageHitRate += groups[findIndex].hitRate;
-          selectedGroups++;
-          break;
-        }
-      }
-    }
-    averageHitRate = selectedGroups ? averageHitRate / selectedGroups : 0;
-
-    return {
-      phases: selected,
-      threshold: lowThreshold,
-      windowStart: windowMetrics[0].frame,
-      windowEnd: windowMetrics[windowMetrics.length - 1].frame + 1,
-      confidence: candidateCount > maxPhases ? "review" : (averageHitRate >= 0.85 ? "high" : (averageHitRate >= 0.6 ? "medium" : "review"))
-    };
-  }
-
-  function phaseListContains(phases, phase) {
-    for (var i = 0; i < phases.length; i++) {
-      if (phases[i] === phase) return true;
-    }
-    return false;
-  }
-
-  function getSourceFrameCount(sourceRef, fps) {
+  function getVisibleFrameCount(sourceRef, fps) {
     var duration = sourceRef.source && sourceRef.source.duration ? sourceRef.source.duration : 0;
     if (sourceRef.layer) duration = Math.max(0, sourceRef.layer.outPoint - sourceRef.layer.inPoint);
 
     var count = Math.round(duration * fps);
     if (!isFinite(count) || count < 2) {
-      fail("Could not determine a usable source duration. Check the selected source and FPS.");
+      fail("Could not determine a usable visible duration.");
     }
     return count;
   }
 
-  function buildKeepFrames(frameCount, period, phases) {
-    var keepFrames = [];
-    for (var frame = 0; frame < frameCount; frame++) {
-      if (!phaseListContains(phases, frame % period)) keepFrames.push(frame);
+  function runFfmpegDiffProbe(file, ffmpegPath, frameLimit) {
+    var filter = "select=lt(n\\," + frameLimit + "),scale=160:-1,tblend=all_mode=difference,signalstats,metadata=print:file=-:key=lavfi.signalstats.YAVG";
+    var command = aeShellQuote(ffmpegPath) +
+      " -hide_banner -v error -i " + aeShellQuote(file.fsName) +
+      " -vf " + aeShellQuote(filter) +
+      " -frames:v " + frameLimit +
+      " -an -f null - 2>&1";
+
+    return system.callSystem(command);
+  }
+
+  function getOriginalSourceTime(sourceRef, frameIndex, fps) {
+    if (sourceRef.layer) {
+      var compTime = sourceRef.layer.inPoint + frameIndex / fps;
+      try {
+        return sourceRef.layer.sourceTime(compTime);
+      } catch (err) {
+        return (sourceRef.layer.inPoint - sourceRef.layer.startTime) + frameIndex / fps;
+      }
     }
-    return keepFrames;
+    return frameIndex / fps;
   }
 
   function setHoldKeys(property) {
     for (var keyIndex = 1; keyIndex <= property.numKeys; keyIndex++) {
       property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
     }
-  }
-
-  function getOriginalSourceTime(sourceRef, frameIndex, fps) {
-    if (sourceRef.layer) {
-      var compTime = sourceRef.layer.startTime + frameIndex / fps;
-      try {
-        return sourceRef.layer.sourceTime(compTime);
-      } catch (err) {
-        return frameIndex / fps;
-      }
-    }
-    return frameIndex / fps;
   }
 
   function uniqueCompName(baseName) {
@@ -510,55 +778,227 @@
     return parts.join(",");
   }
 
-  app.beginUndoGroup("Frame Plucker");
+  function formatEffectiveFps(fps, period, removedPerPeriod) {
+    var value = fps * (period - removedPerPeriod) / period;
+    return String(Math.round(value * 100) / 100);
+  }
 
-  var settings = chooseSettings();
-  if (!settings) {
-    app.endUndoGroup();
+  function removalPercent(removed, total) {
+    return total ? Math.round(removed / total * 100) : 0;
+  }
+
+  function freezeMarkerSuffix(detection) {
+    var text = "";
+    if (!detection.freezes) return text;
+    for (var i = 0; i < detection.freezes.length; i++) {
+      text += "; freeze " + detection.freezes[i].start + "+" + detection.freezes[i].length;
+    }
+    return text;
+  }
+
+  function freezeAlertLines(detection) {
+    var text = "";
+    if (!detection.freezes) return text;
+    for (var i = 0; i < detection.freezes.length; i++) {
+      text += "Kept: " + detection.freezes[i].length + "-frame freeze at frame " + detection.freezes[i].start + "\n";
+    }
+    return text;
+  }
+
+  function makeDetectionSummary(name, fps, detection, removed, frameCount) {
+    var freezeSuffix = freezeMarkerSuffix(detection);
+    if (detection.mode === "drift") {
+      return "Created " + name + ". Detected a drifting hold cadence: removed " + removed + " duplicate frames (~1 every " + detection.medianGap + "). Confidence: " + detection.confidence + "." + freezeSuffix;
+    }
+    if (detection.mode === "scattered") {
+      return "Created " + name + ". Removed " + removed + " isolated held frame(s); no repeating cadence in the rest of the clip. Confidence: " + detection.confidence + "." + freezeSuffix;
+    }
+    return "Created " + name + ". Detected " + detection.phases.length + " duplicate frame(s) every " + detection.period + " - the clip is effectively " + formatEffectiveFps(fps, detection.period, detection.phases.length) + " fps content. Removed " + removed + " of " + frameCount + " frames. Confidence: " + detection.confidence + ". Phases: " + phasesToText(detection.phases) + "." + freezeSuffix;
+  }
+
+  function makeResultAlertMessage(name, fps, detection, removed, frameCount) {
+    var pct = removalPercent(removed, frameCount);
+    var freezeLines = freezeAlertLines(detection);
+    if (detection.mode === "drift") {
+      return "Clean comp created:\n" + name + "\n\n" +
+        "Cadence: drifting hold, about 1 duplicate every " + detection.medianGap + " frames\n" +
+        "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
+        freezeLines +
+        "Confidence: medium";
+    }
+    if (detection.mode === "scattered") {
+      return "Clean comp created:\n" + name + "\n\n" +
+        "Found " + detection.dupFrames.length + " isolated held frame(s); no repeating cadence elsewhere.\n" +
+        "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
+        freezeLines +
+        "Confidence: medium";
+    }
+    return "Clean comp created:\n" + name + "\n\n" +
+      "Cadence: 1 duplicate every " + detection.period + " frames on phase(s) " + phasesToText(detection.phases) + "\n" +
+      "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
+      "Content rate: ~" + formatEffectiveFps(fps, detection.period, detection.phases.length) + " fps inside a " + fps + " fps clip\n" +
+      freezeLines +
+      "Confidence: " + detection.confidence;
+  }
+
+  function makeMediumConfidencePrompt(detection, frameCount) {
+    if (detection.mode === "drift") {
+      return "Found a drifting hold cadence.\n\n" +
+        "About 1 duplicate every " + detection.medianGap + " frames\n" +
+        detection.dupFrames.length + " duplicates across " + frameCount + " frames\n" +
+        "Confidence: MEDIUM\n\n" +
+        "Create the clean comp?";
+    }
+    if (detection.mode === "scattered") {
+      return "No repeating cadence, but " + detection.dupFrames.length +
+        " isolated held frame(s) were found\n" +
+        "(first at frame " + detection.dupFrames[0] + ").\n\n" +
+        "Remove just those frames?";
+    }
+    return "Cadence found, but sections of the clip disagree (or the clip is short).\n\n" +
+      "Pattern: 1 duplicate every " + detection.period + " frames on phase(s) " + phasesToText(detection.phases) + "\n" +
+      "Confidence: MEDIUM\n\n" +
+      "Create the clean comp?";
+  }
+
+  function makeNoCadenceAlertMessage(fps, detection) {
+    var message = "No duplicate-frame cadence found.\n\n";
+    if (detection.reason === "freeze_only") {
+      message += "The clip's duplicates form freeze holds, not a stutter cadence.\n\n";
+    }
+    return message + "This clip plays like genuine " + fps + " fps motion - nothing to remove.";
+  }
+
+  function getRunFfmpegPath() {
+    var cached = getCachedFfmpegPath();
+    return cached || findDefaultFfmpegPath();
+  }
+
+  function makeFfmpegFailureMessage(output, includeDownload) {
+    var message = "ffmpeg could not analyze this clip.\n\nffmpeg said:\n" + lastNonEmptyLines(output, 4);
+    return includeDownload ? message + "\n\nDownload ffmpeg: ffmpeg.org/download.html" : message;
+  }
+
+  function analyzeSourceWithFfmpeg(sourceRef, frameLimit) {
+    var ffmpegPath = getRunFfmpegPath();
+    var output = runFfmpegDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
+    var metrics = parseDiffMetrics(output);
+    if (metrics.length >= 12) {
+      saveCachedFfmpegPath(ffmpegPath);
+      return { metrics: metrics };
+    }
+
+    if (isNotFoundOutput(output)) {
+      clearCachedFfmpegPath();
+      var file = File.openDialog("Locate the ffmpeg executable");
+      if (file) {
+        var retryPath = file.fsName;
+        var retryOutput = runFfmpegDiffProbe(sourceRef.file, retryPath, frameLimit);
+        var retryMetrics = parseDiffMetrics(retryOutput);
+        if (retryMetrics.length >= 12) {
+          saveCachedFfmpegPath(retryPath);
+          return { metrics: retryMetrics };
+        }
+        fail(makeFfmpegFailureMessage(retryOutput, true));
+      }
+      fail(makeFfmpegFailureMessage(output, true));
+    }
+
+    fail(makeFfmpegFailureMessage(output, false));
+  }
+
+  var sourceRef = resolveSourceRef();
+  validateSourceRef(sourceRef);
+  var fps = getSourceFrameRate(sourceRef);
+  if (!isFinite(fps) || fps <= 0) fail("Could not determine a positive source frame rate.");
+
+  var probeFrameCount = getProbeFrameCount(sourceRef, fps);
+  writeLn("Frame Plucker: analyzing " + sourceRef.name + " (" + probeFrameCount + " frames)...");
+  var analysisResult = analyzeSourceWithFfmpeg(sourceRef, probeFrameCount);
+  writeLn("Frame Plucker: analysis done.");
+
+  var metrics = analysisResult.metrics;
+
+  var detection = detectCadence(metrics, MAX_PHASES, 0);
+  if (!detection.hasCadence) {
+    if (detection.reason === "too_many_phases") {
+      var tooManyPhasesMessage = "Found " + detection.phases.length + " duplicate phases per " + detection.periodResult.period + "-frame period - more than this\n" +
+        "tool will remove automatically.\n\n" +
+        "This may not be a cadence that is safe to clean.";
+      alert(tooManyPhasesMessage, "Frame Plucker");
+      return;
+    }
+    alert(makeNoCadenceAlertMessage(fps, detection), "Frame Plucker");
     return;
   }
 
-  var output = runFfmpegDiffProbe(settings.sourceRef.file, settings.ffmpegPath, settings.searchFrames);
-  var metrics = parseDiffMetrics(output);
-  var detection = detectPhases(metrics, settings.period, settings.maxPhases, settings.scanFrames);
-  var frameCount = getSourceFrameCount(settings.sourceRef, settings.fps);
-  var keepFrames = buildKeepFrames(frameCount, settings.period, detection.phases);
+  var visibleFrameCount = getVisibleFrameCount(sourceRef, fps);
+  var srcStartFrame = Math.round(getOriginalSourceTime(sourceRef, 0, fps) * fps);
+
+  if (detection.confidence === "medium") {
+    var proceed = confirm(makeMediumConfidencePrompt(detection, visibleFrameCount), false, "Frame Plucker");
+    if (!proceed) return;
+  }
+
+  if (detection.mode !== "locked") {
+    // tblend emits one fewer metric than source frames; the final diff metric covers the next source frame.
+    var lastAnalyzedSourceFrame = metrics[metrics.length - 1].frame + 1;
+    if (srcStartFrame + visibleFrameCount - 1 > lastAnalyzedSourceFrame) {
+      fail("Clip is longer than the analyzed range; per-frame cleanup needs the whole clip analyzed. Trim the layer or raise the analysis cap.");
+    }
+  }
+  var keepFrames = detection.mode === "locked"
+    ? buildKeepFrames(visibleFrameCount, detection.period, detection.phases, srcStartFrame)
+    : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame);
   if (keepFrames.length < 2) fail("Detected cadence removes too many frames.");
 
-  var cleanDuration = keepFrames.length / settings.fps;
-  var phaseLabel = detection.phases.join("-");
-  var cleanName = uniqueCompName(settings.sourceRef.baseName + "_ffmpeg_clean_p" + settings.period + "_phase" + phaseLabel);
-  var cleanComp = app.project.items.addComp(
-    cleanName,
-    settings.sourceRef.width,
-    settings.sourceRef.height,
-    settings.sourceRef.pixelAspect,
-    cleanDuration,
-    settings.fps
-  );
-  cleanComp.bgColor = settings.sourceRef.bgColor;
+  app.beginUndoGroup("Frame Plucker");
+  try {
+    var cleanDuration = keepFrames.length / fps;
+    var cleanNameBase;
+    if (detection.mode === "drift") {
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_driftg" + detection.medianGap;
+    } else if (detection.mode === "scattered") {
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_pluck" + detection.dupFrames.length;
+    } else {
+      var phaseLabel = phasesToText(detection.phases).replace(/,/g, "-");
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_p" + detection.period + "_phase" + phaseLabel;
+    }
+    var cleanName = uniqueCompName(cleanNameBase);
+    var cleanComp = app.project.items.addComp(
+      cleanName,
+      sourceRef.width,
+      sourceRef.height,
+      sourceRef.pixelAspect,
+      cleanDuration,
+      fps
+    );
+    cleanComp.bgColor = sourceRef.bgColor;
 
-  var cleanLayer = cleanComp.layers.add(settings.sourceRef.source);
-  cleanLayer.name = settings.sourceRef.name + " ffmpeg cadence clean";
-  cleanLayer.startTime = 0;
-  cleanLayer.inPoint = 0;
-  cleanLayer.outPoint = cleanDuration;
-  cleanLayer.audioEnabled = false;
-  cleanLayer.timeRemapEnabled = true;
+    var cleanLayer = cleanComp.layers.add(sourceRef.source);
+    cleanLayer.name = sourceRef.name + " ffmpeg cadence clean";
+    cleanLayer.startTime = 0;
+    cleanLayer.inPoint = 0;
+    cleanLayer.outPoint = cleanDuration;
+    cleanLayer.audioEnabled = false;
+    cleanLayer.timeRemapEnabled = true;
 
-  var remap = cleanLayer.property("ADBE Time Remapping");
-  for (var i = 0; i < keepFrames.length; i++) {
-    remap.setValueAtTime(i / settings.fps, getOriginalSourceTime(settings.sourceRef, keepFrames[i], settings.fps));
+    var remap = cleanLayer.property("ADBE Time Remapping");
+    for (var i = 0; i < keepFrames.length; i++) {
+      remap.setValueAtTime(i / fps, getOriginalSourceTime(sourceRef, keepFrames[i], fps));
+    }
+    remap.setValueAtTime(cleanDuration, getOriginalSourceTime(sourceRef, keepFrames[keepFrames.length - 1], fps));
+    setHoldKeys(remap);
+
+    var removedFrameCount = visibleFrameCount - keepFrames.length;
+    var summary = makeDetectionSummary(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+    var resultMessage = makeResultAlertMessage(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+    var marker = new MarkerValue(summary);
+    cleanComp.markerProperty.setValueAtTime(0, marker);
+    cleanComp.openInViewer();
+  } finally {
+    app.endUndoGroup();
   }
-  remap.setValueAtTime(cleanDuration, getOriginalSourceTime(settings.sourceRef, keepFrames[keepFrames.length - 1], settings.fps));
-  setHoldKeys(remap);
 
-  cleanComp.openInViewer();
-  app.endUndoGroup();
-
-  alert(
-    "Clean comp created. Pattern p" + settings.period + " phase " + phasesToText(detection.phases) +
-    ". Removed " + (frameCount - keepFrames.length) + "/" + frameCount +
-    " frames. Confidence: " + detection.confidence + ". Window: " + detection.windowStart + "-" + detection.windowEnd + "."
-  );
+  alert(resultMessage, "Frame Plucker");
 }());
