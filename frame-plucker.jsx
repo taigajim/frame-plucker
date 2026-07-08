@@ -1,10 +1,11 @@
 // Frame Plucker
 // Uses ffmpeg to remove repeated held frames from file-backed video in After Effects.
 
-(function () {
+(function (thisObj) {
   var HARD_CAP = 1500;
   var SETTINGS_SECTION = "FramePlucker";
   var SETTINGS_FFMPEG_PATH = "ffmpegPath";
+  var MANAGED_DIR_NAME = "Frame Plucker";
 
 // === CORE BEGIN ===
   var MIN_PHASE_SAMPLES = 6;
@@ -34,6 +35,12 @@
   // A 4fps-in-24 cadence creates runs of 5 duplicates and remains cadence evidence;
   // runs of 6+ are treated as freeze holds, so lower content rates are out of scope.
   var FREEZE_MIN_RUN = 6;
+  // A real freeze can briefly rise above the duplicate cutoff for a frame or two
+  // (codec flicker), splitting one hold into a freeze + a short run + a freeze.
+  // Short duplicate runs within this many motion frames of a freeze are absorbed
+  // into it, so the flicker is not miscounted as cadence residual. Kept at 2 so a
+  // genuine cadence duplicate 3+ frames before a freeze onset is left alone.
+  var FREEZE_MERGE_GAP = 2;
   function shellQuote(value, isWin) {
     var text = String(value);
     if (isWin) {
@@ -158,39 +165,108 @@
   function isDuplicateMetric(metric, analysis) {
     return metric.value <= analysis.cutoff;
   }
+  function collectDupRuns(metrics, analysis) {
+    // Contiguous runs of duplicate-candidate frames, as index ranges into metrics.
+    var runs = [];
+    var startIndex = -1;
+    var length = 0;
+    for (var i = 0; i < metrics.length; i++) {
+      if (isDuplicateMetric(metrics[i], analysis)) {
+        if (length > 0 && metrics[i].frame === metrics[i - 1].frame + 1) {
+          length++;
+        } else {
+          if (length > 0) runs.push({ startIndex: startIndex, length: length });
+          startIndex = i;
+          length = 1;
+        }
+      } else {
+        if (length > 0) runs.push({ startIndex: startIndex, length: length });
+        startIndex = -1;
+        length = 0;
+      }
+    }
+    if (length > 0) runs.push({ startIndex: startIndex, length: length });
+    return runs;
+  }
+
+  function runGap(metrics, a, b) {
+    // Number of non-duplicate (motion) frames between two runs, order-independent.
+    var aStart = metrics[a.startIndex].frame;
+    var aEnd = metrics[a.startIndex + a.length - 1].frame;
+    var bStart = metrics[b.startIndex].frame;
+    var bEnd = metrics[b.startIndex + b.length - 1].frame;
+    if (bStart > aEnd) return bStart - aEnd - 1;
+    if (aStart > bEnd) return aStart - bEnd - 1;
+    return 0;
+  }
+
   function splitFreezeSpans(metrics, analysis) {
     var working = [];
     var freezes = [];
-    var runStartIndex = -1;
-    var runLength = 0;
+    if (!metrics.length) return { working: working, freezes: freezes };
 
-    function flushRun() {
-      if (runLength >= FREEZE_MIN_RUN && analysis.floor > 0) {
-        freezes.push({ start: metrics[runStartIndex].frame, length: runLength });
-      } else {
-        for (var runIndex = 0; runIndex < runLength; runIndex++) {
-          working.push(metrics[runStartIndex + runIndex]);
+    var runs = collectDupRuns(metrics, analysis);
+    var frozen = [];
+    var i;
+    for (i = 0; i < metrics.length; i++) frozen[i] = false;
+
+    if (analysis.floor > 0) {
+      var isFreeze = [];
+      var r;
+      for (r = 0; r < runs.length; r++) isFreeze[r] = runs[r].length >= FREEZE_MIN_RUN;
+
+      // Absorb short duplicate runs that are freeze flicker (within
+      // FREEZE_MERGE_GAP motion frames of a freeze). Iterate so a flicker run
+      // wedged between two freezes links the whole hold together.
+      var changed = true;
+      while (changed) {
+        changed = false;
+        for (var a = 0; a < runs.length; a++) {
+          // Only multi-frame runs are flicker; an isolated single near a freeze
+          // is more likely a cadence duplicate, so never absorb length-1 runs.
+          if (isFreeze[a] || runs[a].length < 2) continue;
+          for (var b = 0; b < runs.length; b++) {
+            if (!isFreeze[b]) continue;
+            if (runGap(metrics, runs[a], runs[b]) <= FREEZE_MERGE_GAP) {
+              isFreeze[a] = true;
+              changed = true;
+              break;
+            }
+          }
         }
       }
-      runStartIndex = -1;
-      runLength = 0;
+
+      // Mark frozen indices for freeze runs, plus the small motion gaps between
+      // adjacent freeze runs so each hold becomes one contiguous span.
+      for (var f = 0; f < runs.length; f++) {
+        if (!isFreeze[f]) continue;
+        for (var idx = runs[f].startIndex; idx < runs[f].startIndex + runs[f].length; idx++) frozen[idx] = true;
+      }
+      for (var g = 1; g < runs.length; g++) {
+        if (isFreeze[g] && isFreeze[g - 1] && runGap(metrics, runs[g - 1], runs[g]) <= FREEZE_MERGE_GAP) {
+          var gapStart = runs[g - 1].startIndex + runs[g - 1].length;
+          var gapEnd = runs[g].startIndex;
+          for (var m = gapStart; m < gapEnd; m++) frozen[m] = true;
+        }
+      }
     }
 
-    for (var i = 0; i < metrics.length; i++) {
-      if (isDuplicateMetric(metrics[i], analysis)) {
-        if (runLength > 0 && metrics[i].frame === metrics[i - 1].frame + 1) {
-          runLength++;
-        } else {
-          if (runLength > 0) flushRun();
-          runStartIndex = i;
-          runLength = 1;
-        }
+    // Emit contiguous frozen spans as freezes; everything else is working.
+    var spanStart = -1;
+    for (i = 0; i < metrics.length; i++) {
+      if (frozen[i]) {
+        if (spanStart < 0) spanStart = i;
       } else {
-        if (runLength > 0) flushRun();
+        if (spanStart >= 0) {
+          freezes.push({ start: metrics[spanStart].frame, length: metrics[i - 1].frame - metrics[spanStart].frame + 1 });
+          spanStart = -1;
+        }
         working.push(metrics[i]);
       }
     }
-    if (runLength > 0) flushRun();
+    if (spanStart >= 0) {
+      freezes.push({ start: metrics[spanStart].frame, length: metrics[metrics.length - 1].frame - metrics[spanStart].frame + 1 });
+    }
 
     return { working: working, freezes: freezes };
   }
@@ -550,7 +626,9 @@
 
   function fail(message) {
     alert(message, "Frame Plucker");
-    throw new Error(message);
+    var err = new Error(message);
+    err.framePluckerHandled = true;
+    throw err;
   }
 
   function lowerText(value) {
@@ -599,7 +677,96 @@
     }
   }
 
+  function scriptFolder() {
+    try {
+      if ($.fileName) return new File($.fileName).parent;
+    } catch (err) {}
+    return null;
+  }
+
+  function bundledLeafName() {
+    return isWindows() ? "ffmpeg.exe" : "ffmpeg";
+  }
+
+  function bundledRelDir() {
+    return isWindows() ? "win" : "mac";
+  }
+
+  function managedBinFolder() {
+    return new Folder(Folder.userData.fsName + "/" + MANAGED_DIR_NAME + "/bin");
+  }
+
+  function managedFfmpegFile() {
+    return new File(managedBinFolder().fsName + "/" + bundledLeafName());
+  }
+
+  function findBundledSourceFile(baseFolder) {
+    if (!baseFolder) return null;
+    try {
+      var f = new File(baseFolder.fsName + "/bin/" + bundledRelDir() + "/" + bundledLeafName());
+      if (f.exists) return f;
+    } catch (err) {}
+    return null;
+  }
+
+  function prepareMacBinary(file) {
+    // Bundled binaries lose their executable bit through some zip/copy paths, and
+    // a browser download tags them com.apple.quarantine, which Gatekeeper uses to
+    // kill an unsigned exec launched from a shell. Fix both once, in place. These
+    // calls emit almost no output, so they are not exposed to the callSystem
+    // pipe-buffer freeze.
+    if (!isMac()) return;
+    var quoted = aeShellQuote(file.fsName);
+    try { system.callSystem("/bin/chmod 755 " + quoted); } catch (err) {}
+    try { system.callSystem("/usr/bin/xattr -d com.apple.quarantine " + quoted + " 2>/dev/null"); } catch (err2) {}
+  }
+
+  function provisionFromSource(srcFile) {
+    // Copy the bundled binary into a user-writable managed dir (no admin needed),
+    // fix mac perms/quarantine there, and verify it runs before trusting it.
+    if (!srcFile || !srcFile.exists) return null;
+    try {
+      var destFolder = managedBinFolder();
+      if (!destFolder.exists) {
+        // Create the parent chain explicitly; Folder.create() is not reliably
+        // recursive across ExtendScript versions.
+        var parent = destFolder.parent;
+        if (parent && !parent.exists) parent.create();
+        destFolder.create();
+        if (!destFolder.exists) return null;
+      }
+      var dest = managedFfmpegFile();
+      if (!dest.exists) {
+        if (!srcFile.copy(dest.fsName)) return null;
+      }
+      prepareMacBinary(dest);
+      if (commandWorks(dest.fsName)) return dest.fsName;
+    } catch (err) {}
+    return null;
+  }
+
+  function resolveBundledFfmpeg(allowPrompt) {
+    // 1. Already provisioned into the managed dir (fast path after first run).
+    var managed = managedFfmpegFile();
+    if (managed.exists && commandWorks(managed.fsName)) return managed.fsName;
+
+    // 2. Bundled next to this script (folder-drop install or run-from-package).
+    var fromScript = provisionFromSource(findBundledSourceFile(scriptFolder()));
+    if (fromScript) return fromScript;
+
+    // 3. As a last resort, ask the user once to point at the unzipped folder.
+    if (allowPrompt) {
+      var picked = Folder.selectDialog("Select the Frame Plucker folder you unzipped");
+      if (picked) {
+        var fromPicked = provisionFromSource(findBundledSourceFile(picked));
+        if (fromPicked) return fromPicked;
+      }
+    }
+    return null;
+  }
+
   function findDefaultFfmpegPath() {
+    // Respect an ffmpeg the user already has before falling back to our bundle.
     if (commandWorks("ffmpeg")) return "ffmpeg";
 
     var candidates = isMac()
@@ -614,6 +781,11 @@
         if (candidate.exists && commandWorks(candidate.fsName)) return candidate.fsName;
       } catch (err) {}
     }
+
+    // No user-supplied ffmpeg: fall back to the bundled binary (no prompt here;
+    // the prompt-based recovery lives in analyzeSourceWithFfmpeg).
+    var bundled = resolveBundledFfmpeg(false);
+    if (bundled) return bundled;
 
     return "ffmpeg";
   }
@@ -723,15 +895,49 @@
     return count;
   }
 
+  function makeTempFile(tag) {
+    var stamp = (new Date()).getTime();
+    return new File(Folder.temp.fsName + "/fp_" + tag + "_" + stamp + ".txt");
+  }
+
+  function readAndRemove(tmpFile) {
+    var text = "";
+    try {
+      if (tmpFile.exists && tmpFile.open("r")) {
+        text = tmpFile.read();
+        tmpFile.close();
+      }
+    } catch (err) {}
+    try { if (tmpFile.exists) tmpFile.remove(); } catch (err2) {}
+    return String(text);
+  }
+
   function runFfmpegDiffProbe(file, ffmpegPath, frameLimit) {
+    var metricsFile = makeTempFile("metrics");
+    var errFile = makeTempFile("err");
     var filter = "select=lt(n\\," + frameLimit + "),scale=160:-1,tblend=all_mode=difference,signalstats,metadata=print:file=-:key=lavfi.signalstats.YAVG";
+    // Redirect ffmpeg's stdout (metadata) and stderr to temp files at the shell
+    // level instead of capturing a large stdout pipe. AE's blocking
+    // system.callSystem() can deadlock/freeze when the child fills the OS pipe
+    // buffer faster than AE drains it, and a full-clip probe emits up to
+    // HARD_CAP metadata lines. The filter chain is unchanged (file=- keeps the
+    // Windows-path colon out of the filtergraph), so fixtures stay valid.
     var command = aeShellQuote(ffmpegPath) +
       " -hide_banner -v error -i " + aeShellQuote(file.fsName) +
       " -vf " + aeShellQuote(filter) +
       " -frames:v " + frameLimit +
-      " -an -f null - 2>&1";
+      " -an -f null -" +
+      " 1>" + aeShellQuote(metricsFile.fsName) +
+      " 2>" + aeShellQuote(errFile.fsName);
 
-    return system.callSystem(command);
+    system.callSystem(command);
+
+    var metricsText = readAndRemove(metricsFile);
+    var errText = readAndRemove(errFile);
+    // parseDiffMetrics reads the metadata lines; isNotFoundOutput and the
+    // failure messages read ffmpeg's stderr. Returning both keeps every caller
+    // working against a single string, as before.
+    return metricsText + "\n" + errText;
   }
 
   function getOriginalSourceTime(sourceRef, frameIndex, fps) {
@@ -870,8 +1076,15 @@
   }
 
   function getRunFfmpegPath() {
+    // PATH always wins, on every run and on both Mac and Windows: a pro user's
+    // own ffmpeg is never shadowed by a cached bundle, and if they install
+    // ffmpeg later we pick it up automatically. This probe is at pluck time, not
+    // script load, so the panel still opens instantly. Users with no ffmpeg on
+    // PATH fall through to the cached/common/bundled resolution below.
+    if (commandWorks("ffmpeg")) return "ffmpeg";
     var cached = getCachedFfmpegPath();
-    return cached || findDefaultFfmpegPath();
+    if (cached && commandWorks(cached)) return cached;
+    return findDefaultFfmpegPath();
   }
 
   function makeFfmpegFailureMessage(output, includeDownload) {
@@ -890,6 +1103,17 @@
 
     if (isNotFoundOutput(output)) {
       clearCachedFfmpegPath();
+      // Try the bundled engine first (may prompt once for the unzipped folder),
+      // so users without ffmpeg never need to hunt for an executable.
+      var bundledPath = resolveBundledFfmpeg(true);
+      if (bundledPath) {
+        var bundledOutput = runFfmpegDiffProbe(sourceRef.file, bundledPath, frameLimit);
+        var bundledMetrics = parseDiffMetrics(bundledOutput);
+        if (bundledMetrics.length >= 12) {
+          saveCachedFfmpegPath(bundledPath);
+          return { metrics: bundledMetrics };
+        }
+      }
       var file = File.openDialog("Locate the ffmpeg executable");
       if (file) {
         var retryPath = file.fsName;
@@ -907,98 +1131,210 @@
     fail(makeFfmpegFailureMessage(output, false));
   }
 
-  var sourceRef = resolveSourceRef();
-  validateSourceRef(sourceRef);
-  var fps = getSourceFrameRate(sourceRef);
-  if (!isFinite(fps) || fps <= 0) fail("Could not determine a positive source frame rate.");
+  function collectDebugMarks(detection, metrics) {
+    // Source frames the pluck would remove. When no cadence was found, fall back
+    // to the raw duplicate candidates so a false negative is still inspectable.
+    var frames = [];
+    var i, phase;
+    if (detection.hasCadence && detection.mode === "locked") {
+      for (i = 0; i < metrics.length; i++) {
+        phase = ((metrics[i].frame % detection.period) + detection.period) % detection.period;
+        if (phaseListContains(detection.phases, phase)) frames.push(metrics[i].frame);
+      }
+    } else if (detection.hasCadence) {
+      for (i = 0; i < detection.dupFrames.length; i++) frames.push(detection.dupFrames[i]);
+    } else if (detection.analysis) {
+      for (i = 0; i < metrics.length; i++) {
+        if (metrics[i].value <= detection.analysis.cutoff) frames.push(metrics[i].frame);
+      }
+    }
+    return frames;
+  }
 
-  var probeFrameCount = getProbeFrameCount(sourceRef, fps);
-  writeLn("Frame Plucker: analyzing " + sourceRef.name + " (" + probeFrameCount + " frames)...");
-  var analysisResult = analyzeSourceWithFfmpeg(sourceRef, probeFrameCount);
-  writeLn("Frame Plucker: analysis done.");
+  function buildDebugComp(sourceRef, fps, frameCount, frames) {
+    var name = uniqueCompName(sourceRef.baseName + "_ffmpeg_DEBUG_marks");
+    var comp = app.project.items.addComp(name, sourceRef.width, sourceRef.height, sourceRef.pixelAspect, frameCount / fps, fps);
+    comp.bgColor = sourceRef.bgColor;
+    var layer = comp.layers.add(sourceRef.source);
+    layer.name = sourceRef.name + " (debug: nothing removed)";
+    layer.startTime = 0;
+    layer.audioEnabled = false;
+    var markerProp = layer.property("Marker");
+    for (var i = 0; i < frames.length; i++) {
+      markerProp.setValueAtTime(frames[i] / fps, new MarkerValue(""));
+    }
+    comp.openInViewer();
+    return name;
+  }
 
-  var metrics = analysisResult.metrics;
+  function makeDebugMessage(detection, marks, name) {
+    var head = "DEBUG - nothing removed.\n\nMarked " + marks.length + " frame(s) on:\n" + name + "\n\n";
+    if (detection.hasCadence) {
+      if (detection.mode === "locked") {
+        return head + "Would remove phase(s) " + phasesToText(detection.phases) + " every " + detection.period +
+          " frames.\nStep through and confirm each marked frame is a held frame.";
+      }
+      if (detection.mode === "drift") {
+        return head + "Would remove a drifting hold (~1 every " + detection.medianGap + " frames).";
+      }
+      return head + "Would remove " + (detection.dupFrames ? detection.dupFrames.length : marks.length) + " isolated held frame(s).";
+    }
+    return head + "No cadence (" + (detection.reason || "unknown") + "). Marks show the raw duplicate candidates the metric found.";
+  }
 
-  var detection = detectCadence(metrics, MAX_PHASES, 0);
-  if (!detection.hasCadence) {
-    if (detection.reason === "too_many_phases") {
-      var tooManyPhasesMessage = "Found " + detection.phases.length + " duplicate phases per " + detection.periodResult.period + "-frame period - more than this\n" +
-        "tool will remove automatically.\n\n" +
-        "This may not be a cadence that is safe to clean.";
-      alert(tooManyPhasesMessage, "Frame Plucker");
+  function runPluck(debug) {
+    var sourceRef = resolveSourceRef();
+    validateSourceRef(sourceRef);
+    var fps = getSourceFrameRate(sourceRef);
+    if (!isFinite(fps) || fps <= 0) fail("Could not determine a positive source frame rate.");
+
+    var probeFrameCount = getProbeFrameCount(sourceRef, fps);
+    writeLn("Frame Plucker: analyzing " + sourceRef.name + " (" + probeFrameCount + " frames)...");
+    var analysisResult = analyzeSourceWithFfmpeg(sourceRef, probeFrameCount);
+    writeLn("Frame Plucker: analysis done.");
+
+    var metrics = analysisResult.metrics;
+
+    var detection = detectCadence(metrics, MAX_PHASES, 0);
+
+    if (debug) {
+      // Mark what would be removed on a full-length copy of the source; remove
+      // nothing. Short-circuits confirms and comp creation so any detection
+      // (including "no cadence") is inspectable frame by frame.
+      var marks = collectDebugMarks(detection, metrics);
+      app.beginUndoGroup("Frame Plucker Debug");
+      var debugName;
+      try {
+        debugName = buildDebugComp(sourceRef, fps, probeFrameCount, marks);
+      } finally {
+        app.endUndoGroup();
+      }
+      alert(makeDebugMessage(detection, marks, debugName), "Frame Plucker");
       return;
     }
-    alert(makeNoCadenceAlertMessage(fps, detection), "Frame Plucker");
-    return;
-  }
 
-  var visibleFrameCount = getVisibleFrameCount(sourceRef, fps);
-  var srcStartFrame = Math.round(getOriginalSourceTime(sourceRef, 0, fps) * fps);
-
-  if (detection.confidence === "medium") {
-    var proceed = confirm(makeMediumConfidencePrompt(detection, visibleFrameCount), false, "Frame Plucker");
-    if (!proceed) return;
-  }
-
-  if (detection.mode !== "locked") {
-    // tblend emits one fewer metric than source frames; the final diff metric covers the next source frame.
-    var lastAnalyzedSourceFrame = metrics[metrics.length - 1].frame + 1;
-    if (srcStartFrame + visibleFrameCount - 1 > lastAnalyzedSourceFrame) {
-      fail("Clip is longer than the analyzed range; per-frame cleanup needs the whole clip analyzed. Trim the layer or raise the analysis cap.");
+    if (!detection.hasCadence) {
+      if (detection.reason === "too_many_phases") {
+        var tooManyPhasesMessage = "Found " + detection.phases.length + " duplicate phases per " + detection.periodResult.period + "-frame period - more than this\n" +
+          "tool will remove automatically.\n\n" +
+          "This may not be a cadence that is safe to clean.";
+        alert(tooManyPhasesMessage, "Frame Plucker");
+        return;
+      }
+      alert(makeNoCadenceAlertMessage(fps, detection), "Frame Plucker");
+      return;
     }
-  }
-  var keepFrames = detection.mode === "locked"
-    ? buildKeepFrames(visibleFrameCount, detection.period, detection.phases, srcStartFrame)
-    : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame);
-  if (keepFrames.length < 2) fail("Detected cadence removes too many frames.");
 
-  app.beginUndoGroup("Frame Plucker");
-  try {
-    var cleanDuration = keepFrames.length / fps;
-    var cleanNameBase;
-    if (detection.mode === "drift") {
-      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_driftg" + detection.medianGap;
-    } else if (detection.mode === "scattered") {
-      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_pluck" + detection.dupFrames.length;
-    } else {
-      var phaseLabel = phasesToText(detection.phases).replace(/,/g, "-");
-      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_p" + detection.period + "_phase" + phaseLabel;
+    var visibleFrameCount = getVisibleFrameCount(sourceRef, fps);
+    var srcStartFrame = Math.round(getOriginalSourceTime(sourceRef, 0, fps) * fps);
+
+    if (detection.confidence === "medium") {
+      var proceed = confirm(makeMediumConfidencePrompt(detection, visibleFrameCount), false, "Frame Plucker");
+      if (!proceed) return;
     }
-    var cleanName = uniqueCompName(cleanNameBase);
-    var cleanComp = app.project.items.addComp(
-      cleanName,
-      sourceRef.width,
-      sourceRef.height,
-      sourceRef.pixelAspect,
-      cleanDuration,
-      fps
-    );
-    cleanComp.bgColor = sourceRef.bgColor;
 
-    var cleanLayer = cleanComp.layers.add(sourceRef.source);
-    cleanLayer.name = sourceRef.name + " ffmpeg cadence clean";
-    cleanLayer.startTime = 0;
-    cleanLayer.inPoint = 0;
-    cleanLayer.outPoint = cleanDuration;
-    cleanLayer.audioEnabled = false;
-    cleanLayer.timeRemapEnabled = true;
-
-    var remap = cleanLayer.property("ADBE Time Remapping");
-    for (var i = 0; i < keepFrames.length; i++) {
-      remap.setValueAtTime(i / fps, getOriginalSourceTime(sourceRef, keepFrames[i], fps));
+    if (detection.mode !== "locked") {
+      // tblend emits one fewer metric than source frames; the final diff metric covers the next source frame.
+      var lastAnalyzedSourceFrame = metrics[metrics.length - 1].frame + 1;
+      if (srcStartFrame + visibleFrameCount - 1 > lastAnalyzedSourceFrame) {
+        fail("Clip is longer than the analyzed range; per-frame cleanup needs the whole clip analyzed. Trim the layer or raise the analysis cap.");
+      }
     }
-    remap.setValueAtTime(cleanDuration, getOriginalSourceTime(sourceRef, keepFrames[keepFrames.length - 1], fps));
-    setHoldKeys(remap);
+    var keepFrames = detection.mode === "locked"
+      ? buildKeepFrames(visibleFrameCount, detection.period, detection.phases, srcStartFrame)
+      : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame);
+    if (keepFrames.length < 2) fail("Detected cadence removes too many frames.");
 
-    var removedFrameCount = visibleFrameCount - keepFrames.length;
-    var summary = makeDetectionSummary(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
-    var resultMessage = makeResultAlertMessage(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
-    var marker = new MarkerValue(summary);
-    cleanComp.markerProperty.setValueAtTime(0, marker);
-    cleanComp.openInViewer();
-  } finally {
-    app.endUndoGroup();
+    app.beginUndoGroup("Frame Plucker");
+    try {
+      var cleanDuration = keepFrames.length / fps;
+      var cleanNameBase;
+      if (detection.mode === "drift") {
+        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_driftg" + detection.medianGap;
+      } else if (detection.mode === "scattered") {
+        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_pluck" + detection.dupFrames.length;
+      } else {
+        var phaseLabel = phasesToText(detection.phases).replace(/,/g, "-");
+        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_p" + detection.period + "_phase" + phaseLabel;
+      }
+      var cleanName = uniqueCompName(cleanNameBase);
+      var cleanComp = app.project.items.addComp(
+        cleanName,
+        sourceRef.width,
+        sourceRef.height,
+        sourceRef.pixelAspect,
+        cleanDuration,
+        fps
+      );
+      cleanComp.bgColor = sourceRef.bgColor;
+
+      var cleanLayer = cleanComp.layers.add(sourceRef.source);
+      cleanLayer.name = sourceRef.name + " ffmpeg cadence clean";
+      cleanLayer.startTime = 0;
+      cleanLayer.inPoint = 0;
+      cleanLayer.outPoint = cleanDuration;
+      cleanLayer.audioEnabled = false;
+      cleanLayer.timeRemapEnabled = true;
+
+      var remap = cleanLayer.property("ADBE Time Remapping");
+      for (var i = 0; i < keepFrames.length; i++) {
+        remap.setValueAtTime(i / fps, getOriginalSourceTime(sourceRef, keepFrames[i], fps));
+      }
+      remap.setValueAtTime(cleanDuration, getOriginalSourceTime(sourceRef, keepFrames[keepFrames.length - 1], fps));
+      setHoldKeys(remap);
+
+      var removedFrameCount = visibleFrameCount - keepFrames.length;
+      var summary = makeDetectionSummary(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+      var resultMessage = makeResultAlertMessage(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+      var marker = new MarkerValue(summary);
+      cleanComp.markerProperty.setValueAtTime(0, marker);
+      cleanComp.openInViewer();
+    } finally {
+      app.endUndoGroup();
+    }
+
+    alert(resultMessage, "Frame Plucker");
   }
 
-  alert(resultMessage, "Frame Plucker");
-}());
+  function buildPanel(rootObj) {
+    var panel = (rootObj instanceof Panel)
+      ? rootObj
+      : new Window("palette", "Frame Plucker", undefined, { resizeable: true });
+
+    panel.orientation = "column";
+    panel.alignChildren = ["fill", "top"];
+    panel.spacing = 8;
+    panel.margins = 12;
+
+    var hint = panel.add("statictext", undefined,
+      "Select a video in the Project panel (or its layer in a comp), then pluck.",
+      { multiline: true });
+    hint.preferredSize.height = 34;
+
+    var pluckButton = panel.add("button", undefined, "Pluck Frames");
+    var debugCheck = panel.add("checkbox", undefined, "Debug: mark frames, don't remove");
+    debugCheck.helpTip = "Build a comp of the untouched source with a marker on every frame that would be removed, so you can step through and check each one.";
+    pluckButton.onClick = function () {
+      pluckButton.enabled = false;
+      try {
+        runPluck(debugCheck.value);
+      } catch (err) {
+        // fail() already alerted before throwing; only surface unexpected errors.
+        if (!(err && err.framePluckerHandled)) {
+          alert("Something went wrong:\n" + ((err && err.message) ? err.message : String(err)), "Frame Plucker");
+        }
+      } finally {
+        pluckButton.enabled = true;
+      }
+    };
+
+    panel.layout.layout(true);
+    return panel;
+  }
+
+  var ui = buildPanel(thisObj);
+  if (ui instanceof Window) {
+    ui.center();
+    ui.show();
+  }
+}(this));
