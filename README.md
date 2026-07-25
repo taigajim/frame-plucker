@@ -26,6 +26,14 @@ The panel now appears under the Window menu. Dock it wherever you like.
 
 If the clip has no duplicated frames, the panel says so and creates nothing.
 
+Keep **Verify candidates at full resolution** enabled for normal use. Frame
+Plucker first runs a fast low-resolution scan, then uses a slower full-resolution
+comparison only when that scan finds frames it might remove. This second pass
+helps distinguish true held frames from intentional slow movement.
+
+Debug mode creates an untouched comp with markers showing the frames that would
+be removed.
+
 ## ffmpeg
 
 Frame Plucker needs ffmpeg. It uses one you already have on your system first, and

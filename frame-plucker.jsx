@@ -41,6 +41,7 @@
   // into it, so the flicker is not miscounted as cadence residual. Kept at 2 so a
   // genuine cadence duplicate 3+ frames before a freeze onset is left alone.
   var FREEZE_MERGE_GAP = 2;
+  var FULL_RES_SSIM_MIN = 0.9925;
   function shellQuote(value, isWin) {
     var text = String(value);
     if (isWin) {
@@ -65,6 +66,19 @@
       if (valueMatch && currentFrame !== null) {
         metrics.push({ frame: currentFrame, value: parseFloat(valueMatch[1]) });
         currentFrame = null;
+      }
+    }
+    return metrics;
+  }
+  function parseSsimMetrics(output) {
+    var lines = String(output).split(/\r\n|\r|\n/);
+    var metrics = [];
+    for (var i = 0; i < lines.length; i++) {
+      var match = lines[i].match(/n:\s*(\d+).*All:([0-9.]+)/);
+      if (match) {
+        // SSIM pair n compares source frame n with n-1. Store the same
+        // transition index used by the low-resolution tblend metrics.
+        metrics.push({ frame: parseInt(match[1], 10) - 1, value: parseFloat(match[2]) });
       }
     }
     return metrics;
@@ -210,7 +224,7 @@
     var i;
     for (i = 0; i < metrics.length; i++) frozen[i] = false;
 
-    if (analysis.floor > 0) {
+    {
       var isFreeze = [];
       var r;
       for (r = 0; r < runs.length; r++) isFreeze[r] = runs[r].length >= FREEZE_MIN_RUN;
@@ -258,14 +272,16 @@
         if (spanStart < 0) spanStart = i;
       } else {
         if (spanStart >= 0) {
-          freezes.push({ start: metrics[spanStart].frame, length: metrics[i - 1].frame - metrics[spanStart].frame + 1 });
+          // A metric at frame n describes the transition from source frame n
+          // to source frame n+1. Preserve both ends of a freeze transition span.
+          freezes.push({ start: metrics[spanStart].frame, length: metrics[i - 1].frame - metrics[spanStart].frame + 2 });
           spanStart = -1;
         }
         working.push(metrics[i]);
       }
     }
     if (spanStart >= 0) {
-      freezes.push({ start: metrics[spanStart].frame, length: metrics[metrics.length - 1].frame - metrics[spanStart].frame + 1 });
+      freezes.push({ start: metrics[spanStart].frame, length: metrics[metrics.length - 1].frame - metrics[spanStart].frame + 2 });
     }
 
     return { working: working, freezes: freezes };
@@ -603,12 +619,23 @@
     return false;
   }
 
-  function buildKeepFrames(frameCount, period, phases, srcStartFrame) {
+  function sourceFrameInFreeze(sourceFrame, freezes) {
+    if (!freezes) return false;
+    for (var i = 0; i < freezes.length; i++) {
+      if (sourceFrame >= freezes[i].start && sourceFrame < freezes[i].start + freezes[i].length) return true;
+    }
+    return false;
+  }
+  function buildKeepFrames(frameCount, period, phases, srcStartFrame, freezes) {
     var keepFrames = [];
     var startFrame = srcStartFrame || 0;
     for (var frame = 0; frame < frameCount; frame++) {
-      var sourcePhase = (((startFrame + frame) % period) + period) % period;
-      if (!phaseListContains(phases, sourcePhase)) keepFrames.push(frame);
+      var sourceFrame = startFrame + frame;
+      // ffmpeg/tblend metric n compares source frames n and n+1. A detected
+      // phase therefore removes source frame n+1, never the first source frame.
+      var transitionFrame = sourceFrame - 1;
+      var sourcePhase = ((transitionFrame % period) + period) % period;
+      if (sourceFrame <= 0 || sourceFrameInFreeze(sourceFrame, freezes) || !phaseListContains(phases, sourcePhase)) keepFrames.push(frame);
     }
     return keepFrames;
   }
@@ -616,11 +643,72 @@
     var keepFrames = [];
     var startFrame = srcStartFrame || 0;
     var dupLookup = {};
-    for (var i = 0; i < dupFrames.length; i++) dupLookup[dupFrames[i]] = true;
+    // Duplicate metrics identify transitions; remove the repeated frame on the
+    // right-hand side of each transition.
+    for (var i = 0; i < dupFrames.length; i++) dupLookup[dupFrames[i] + 1] = true;
     for (var frame = 0; frame < frameCount; frame++) {
       if (!dupLookup[startFrame + frame]) keepFrames.push(frame);
     }
     return keepFrames;
+  }
+  function candidateTransitionsForDetection(detection, metrics) {
+    var candidates = [];
+    var i;
+    if (detection.mode === "locked") {
+      for (i = 0; i < metrics.length; i++) {
+        var phase = ((metrics[i].frame % detection.period) + detection.period) % detection.period;
+        var targetSourceFrame = metrics[i].frame + 1;
+        if (phaseListContains(detection.phases, phase) && !sourceFrameInFreeze(targetSourceFrame, detection.freezes)) {
+          candidates.push(metrics[i].frame);
+        }
+      }
+    } else {
+      for (i = 0; i < detection.dupFrames.length; i++) candidates.push(detection.dupFrames[i]);
+    }
+    return candidates;
+  }
+  function verifyDetectionWithSsim(detection, metrics, ssimMetrics, minimum) {
+    var lookup = {};
+    for (var i = 0; i < ssimMetrics.length; i++) lookup[ssimMetrics[i].frame] = ssimMetrics[i].value;
+
+    var candidates = candidateTransitionsForDetection(detection, metrics);
+    var confirmed = [];
+    var rejected = [];
+    var missing = [];
+    for (var j = 0; j < candidates.length; j++) {
+      var value = lookup[candidates[j]];
+      if (value === undefined) {
+        missing.push(candidates[j]);
+      } else if (value >= minimum) {
+        confirmed.push(candidates[j]);
+      } else {
+        rejected.push(candidates[j]);
+      }
+    }
+
+    detection.fullResVerified = true;
+    detection.fullResCandidateCount = candidates.length;
+    detection.fullResRejectedCount = rejected.length;
+    detection.fullResMissingCount = missing.length;
+    detection.verifiedDupFrames = confirmed;
+
+    if (missing.length || confirmed.length < 2) {
+      detection.hasCadence = false;
+      detection.reason = missing.length ? "full_res_incomplete" : "full_res_rejected";
+      return detection;
+    }
+    if (rejected.length) detection.confidence = "medium";
+    return detection;
+  }
+  function metricsCoverExpectedProbe(metrics, frameLimit) {
+    // tblend and the SSIM comparison each emit one metric fewer than the
+    // decoded source-frame count. Allow one additional frame of
+    // duration-rounding tolerance, but reject a truncated/non-contiguous decode.
+    if (metrics.length < Math.max(12, frameLimit - 2)) return false;
+    for (var i = 1; i < metrics.length; i++) {
+      if (metrics[i].frame !== metrics[i - 1].frame + 1) return false;
+    }
+    return true;
   }
 // === CORE END ===
 
@@ -867,6 +955,11 @@
   function validateSourceRef(sourceRef) {
     if (sourceRef.layer) {
       if (Math.abs(sourceRef.layer.stretch - 100) > 0.01 || sourceRef.layer.timeRemapEnabled) fail("Stretched or time-remapped layers are not supported. Select the footage item in the Project panel instead.");
+      var sourceFps = sourceRef.source ? sourceRef.source.frameRate : 0;
+      var compFps = sourceRef.comp ? sourceRef.comp.frameRate : 0;
+      if (!isFinite(sourceFps) || sourceFps <= 0 || !isFinite(compFps) || Math.abs(sourceFps - compFps) > 0.001) {
+        fail("The selected layer's source frame rate does not match the comp frame rate. Select the footage item in the Project panel instead.");
+      }
     }
   }
 
@@ -938,6 +1031,35 @@
     // failure messages read ffmpeg's stderr. Returning both keeps every caller
     // working against a single string, as before.
     return metricsText + "\n" + errText;
+  }
+
+  function runFfmpegSsimProbe(file, ffmpegPath, frameLimit) {
+    var metricsFile = makeTempFile("ssim");
+    var errFile = makeTempFile("ssim_err");
+    var previousLimit = Math.max(1, frameLimit - 1);
+    var filter = "[0:v]split=2[cur][prev];" +
+      "[cur]select=gte(n\\,1)*lt(n\\," + frameLimit + "),setpts=N/TB[cur2];" +
+      "[prev]select=lt(n\\," + previousLimit + "),setpts=N/TB[prev2];" +
+      "[cur2][prev2]ssim=stats_file=-";
+    var command = aeShellQuote(ffmpegPath) +
+      " -hide_banner -v error -i " + aeShellQuote(file.fsName) +
+      " -filter_complex " + aeShellQuote(filter) +
+      " -frames:v " + previousLimit +
+      " -an -f null -" +
+      " 1>" + aeShellQuote(metricsFile.fsName) +
+      " 2>" + aeShellQuote(errFile.fsName);
+
+    system.callSystem(command);
+    return readAndRemove(metricsFile) + "\n" + readAndRemove(errFile);
+  }
+
+  function analyzeSourceSsimWithFfmpeg(sourceRef, ffmpegPath, frameLimit) {
+    var output = runFfmpegSsimProbe(sourceRef.file, ffmpegPath, frameLimit);
+    var metrics = parseSsimMetrics(output);
+    if (!metricsCoverExpectedProbe(metrics, frameLimit)) {
+      fail("Full-resolution verification did not cover the complete analyzed range.\n\nffmpeg said:\n" + lastNonEmptyLines(output, 4));
+    }
+    return metrics;
   }
 
   function getOriginalSourceTime(sourceRef, frameIndex, fps) {
@@ -1025,17 +1147,25 @@
   function makeResultAlertMessage(name, fps, detection, removed, frameCount) {
     var pct = removalPercent(removed, frameCount);
     var freezeLines = freezeAlertLines(detection);
+    var verifiedCount = detection.verifiedDupFrames ? detection.verifiedDupFrames.length : 0;
+    var verificationLine = detection.fullResVerified
+      ? "Full-resolution verified: " + verifiedCount + " removal(s)" +
+        (detection.fullResRejectedCount ? "; kept " + detection.fullResRejectedCount + " slow/unique candidate(s)" : "") + "\n"
+      : "";
     if (detection.mode === "drift") {
       return "Clean comp created:\n" + name + "\n\n" +
         "Cadence: drifting hold, about 1 duplicate every " + detection.medianGap + " frames\n" +
         "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
+        verificationLine +
         freezeLines +
         "Confidence: medium";
     }
     if (detection.mode === "scattered") {
+      var scatteredCount = detection.verifiedDupFrames ? detection.verifiedDupFrames.length : detection.dupFrames.length;
       return "Clean comp created:\n" + name + "\n\n" +
-        "Found " + detection.dupFrames.length + " isolated held frame(s); no repeating cadence elsewhere.\n" +
+        "Found " + scatteredCount + " isolated held frame(s); no repeating cadence elsewhere.\n" +
         "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
+        verificationLine +
         freezeLines +
         "Confidence: medium";
     }
@@ -1043,26 +1173,37 @@
       "Cadence: 1 duplicate every " + detection.period + " frames on phase(s) " + phasesToText(detection.phases) + "\n" +
       "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
       "Content rate: ~" + formatEffectiveFps(fps, detection.period, detection.phases.length) + " fps inside a " + fps + " fps clip\n" +
+      verificationLine +
       freezeLines +
       "Confidence: " + detection.confidence;
   }
 
   function makeMediumConfidencePrompt(detection, frameCount) {
+    var verificationLine = detection.fullResRejectedCount
+      ? "\nFull-resolution verification kept " + detection.fullResRejectedCount + " slow/unique frame candidate(s).\n"
+      : "";
     if (detection.mode === "drift") {
       return "Found a drifting hold cadence.\n\n" +
         "About 1 duplicate every " + detection.medianGap + " frames\n" +
-        detection.dupFrames.length + " duplicates across " + frameCount + " frames\n" +
+        (detection.verifiedDupFrames ? detection.verifiedDupFrames.length : detection.dupFrames.length) + " verified duplicates across " + frameCount + " frames\n" +
+        verificationLine +
         "Confidence: MEDIUM\n\n" +
         "Create the clean comp?";
     }
     if (detection.mode === "scattered") {
-      return "No repeating cadence, but " + detection.dupFrames.length +
-        " isolated held frame(s) were found\n" +
-        "(first at frame " + detection.dupFrames[0] + ").\n\n" +
+      var scatterFrames = detection.verifiedDupFrames || detection.dupFrames;
+      return "No repeating cadence, but " + scatterFrames.length +
+        " isolated held frame(s) were verified\n" +
+        "(first at frame " + (scatterFrames[0] + 1) + ").\n" +
+        verificationLine + "\n" +
         "Remove just those frames?";
     }
-    return "Cadence found, but sections of the clip disagree (or the clip is short).\n\n" +
+    var lockedHead = detection.fullResRejectedCount
+      ? "Cadence found, but the full-resolution check rejected part of the pattern as continuous motion."
+      : "Cadence found, but sections of the clip disagree (or the clip is short).";
+    return lockedHead + "\n\n" +
       "Pattern: 1 duplicate every " + detection.period + " frames on phase(s) " + phasesToText(detection.phases) + "\n" +
+      verificationLine +
       "Confidence: MEDIUM\n\n" +
       "Create the clean comp?";
   }
@@ -1071,6 +1212,10 @@
     var message = "No duplicate-frame cadence found.\n\n";
     if (detection.reason === "freeze_only") {
       message += "The clip's duplicates form freeze holds, not a stutter cadence.\n\n";
+    } else if (detection.reason === "full_res_rejected") {
+      message += "The fast scan found low-motion candidates, but the full-resolution check identified continuous motion rather than repeated frames.\n\n";
+    } else if (detection.reason === "full_res_incomplete") {
+      message += "The full-resolution check was incomplete, so no frames were removed.\n\n";
     }
     return message + "This clip plays like genuine " + fps + " fps motion - nothing to remove.";
   }
@@ -1096,9 +1241,9 @@
     var ffmpegPath = getRunFfmpegPath();
     var output = runFfmpegDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
     var metrics = parseDiffMetrics(output);
-    if (metrics.length >= 12) {
+    if (metricsCoverExpectedProbe(metrics, frameLimit)) {
       saveCachedFfmpegPath(ffmpegPath);
-      return { metrics: metrics };
+      return { metrics: metrics, ffmpegPath: ffmpegPath };
     }
 
     if (isNotFoundOutput(output)) {
@@ -1109,9 +1254,9 @@
       if (bundledPath) {
         var bundledOutput = runFfmpegDiffProbe(sourceRef.file, bundledPath, frameLimit);
         var bundledMetrics = parseDiffMetrics(bundledOutput);
-        if (bundledMetrics.length >= 12) {
+        if (metricsCoverExpectedProbe(bundledMetrics, frameLimit)) {
           saveCachedFfmpegPath(bundledPath);
-          return { metrics: bundledMetrics };
+          return { metrics: bundledMetrics, ffmpegPath: bundledPath };
         }
       }
       var file = File.openDialog("Locate the ffmpeg executable");
@@ -1119,9 +1264,9 @@
         var retryPath = file.fsName;
         var retryOutput = runFfmpegDiffProbe(sourceRef.file, retryPath, frameLimit);
         var retryMetrics = parseDiffMetrics(retryOutput);
-        if (retryMetrics.length >= 12) {
+        if (metricsCoverExpectedProbe(retryMetrics, frameLimit)) {
           saveCachedFfmpegPath(retryPath);
-          return { metrics: retryMetrics };
+          return { metrics: retryMetrics, ffmpegPath: retryPath };
         }
         fail(makeFfmpegFailureMessage(retryOutput, true));
       }
@@ -1136,16 +1281,18 @@
     // to the raw duplicate candidates so a false negative is still inspectable.
     var frames = [];
     var i, phase;
-    if (detection.hasCadence && detection.mode === "locked") {
+    if (detection.hasCadence && detection.verifiedDupFrames) {
+      for (i = 0; i < detection.verifiedDupFrames.length; i++) frames.push(detection.verifiedDupFrames[i] + 1);
+    } else if (detection.hasCadence && detection.mode === "locked") {
       for (i = 0; i < metrics.length; i++) {
         phase = ((metrics[i].frame % detection.period) + detection.period) % detection.period;
-        if (phaseListContains(detection.phases, phase)) frames.push(metrics[i].frame);
+        if (phaseListContains(detection.phases, phase)) frames.push(metrics[i].frame + 1);
       }
     } else if (detection.hasCadence) {
-      for (i = 0; i < detection.dupFrames.length; i++) frames.push(detection.dupFrames[i]);
+      for (i = 0; i < detection.dupFrames.length; i++) frames.push(detection.dupFrames[i] + 1);
     } else if (detection.analysis) {
       for (i = 0; i < metrics.length; i++) {
-        if (metrics[i].value <= detection.analysis.cutoff) frames.push(metrics[i].frame);
+        if (metrics[i].value <= detection.analysis.cutoff) frames.push(metrics[i].frame + 1);
       }
     }
     return frames;
@@ -1170,6 +1317,10 @@
   function makeDebugMessage(detection, marks, name) {
     var head = "DEBUG - nothing removed.\n\nMarked " + marks.length + " frame(s) on:\n" + name + "\n\n";
     if (detection.hasCadence) {
+      if (detection.fullResVerified) {
+        return head + "Full-resolution verification would remove " + detection.verifiedDupFrames.length +
+          " frame(s) and keep " + detection.fullResRejectedCount + " slow/unique candidate(s).";
+      }
       if (detection.mode === "locked") {
         return head + "Would remove phase(s) " + phasesToText(detection.phases) + " every " + detection.period +
           " frames.\nStep through and confirm each marked frame is a held frame.";
@@ -1182,7 +1333,7 @@
     return head + "No cadence (" + (detection.reason || "unknown") + "). Marks show the raw duplicate candidates the metric found.";
   }
 
-  function runPluck(debug) {
+  function runPluck(debug, verifyFullResolution) {
     var sourceRef = resolveSourceRef();
     validateSourceRef(sourceRef);
     var fps = getSourceFrameRate(sourceRef);
@@ -1196,6 +1347,12 @@
     var metrics = analysisResult.metrics;
 
     var detection = detectCadence(metrics, MAX_PHASES, 0);
+    if (verifyFullResolution && detection.hasCadence) {
+      writeLn("Frame Plucker: verifying candidates at full resolution...");
+      var ssimMetrics = analyzeSourceSsimWithFfmpeg(sourceRef, analysisResult.ffmpegPath, probeFrameCount);
+      detection = verifyDetectionWithSsim(detection, metrics, ssimMetrics, FULL_RES_SSIM_MIN);
+      writeLn("Frame Plucker: full-resolution verification done.");
+    }
 
     if (debug) {
       // Mark what would be removed on a full-length copy of the source; remove
@@ -1226,23 +1383,29 @@
     }
 
     var visibleFrameCount = getVisibleFrameCount(sourceRef, fps);
-    var srcStartFrame = Math.round(getOriginalSourceTime(sourceRef, 0, fps) * fps);
+    var exactSrcStartFrame = getOriginalSourceTime(sourceRef, 0, fps) * fps;
+    var srcStartFrame = Math.round(exactSrcStartFrame);
+    if (sourceRef.layer && Math.abs(exactSrcStartFrame - srcStartFrame) > 0.01) {
+      fail("The selected layer starts between source frames. Align its in point to a source frame, or select the footage item in the Project panel instead.");
+    }
 
     if (detection.confidence === "medium") {
       var proceed = confirm(makeMediumConfidencePrompt(detection, visibleFrameCount), false, "Frame Plucker");
       if (!proceed) return;
     }
 
-    if (detection.mode !== "locked") {
-      // tblend emits one fewer metric than source frames; the final diff metric covers the next source frame.
-      var lastAnalyzedSourceFrame = metrics[metrics.length - 1].frame + 1;
-      if (srcStartFrame + visibleFrameCount - 1 > lastAnalyzedSourceFrame) {
-        fail("Clip is longer than the analyzed range; per-frame cleanup needs the whole clip analyzed. Trim the layer or raise the analysis cap.");
-      }
+    // tblend emits one fewer metric than source frames; the final diff metric
+    // covers the next source frame. Never extrapolate even a locked pattern
+    // beyond the analyzed range because cadence can stop or change phase.
+    var lastAnalyzedSourceFrame = metrics[metrics.length - 1].frame + 1;
+    if (srcStartFrame + visibleFrameCount - 1 > lastAnalyzedSourceFrame) {
+      fail("Clip is longer than the analyzed range. Frame Plucker will not remove frames it has not verified; trim the layer or raise the analysis cap.");
     }
-    var keepFrames = detection.mode === "locked"
-      ? buildKeepFrames(visibleFrameCount, detection.period, detection.phases, srcStartFrame)
-      : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame);
+    var keepFrames = detection.verifiedDupFrames
+      ? buildKeepFramesFromDupList(visibleFrameCount, detection.verifiedDupFrames, srcStartFrame)
+      : (detection.mode === "locked"
+        ? buildKeepFrames(visibleFrameCount, detection.period, detection.phases, srcStartFrame, detection.freezes)
+        : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame));
     if (keepFrames.length < 2) fail("Detected cadence removes too many frames.");
 
     app.beginUndoGroup("Frame Plucker");
@@ -1312,12 +1475,15 @@
     hint.preferredSize.height = 34;
 
     var pluckButton = panel.add("button", undefined, "Pluck Frames");
+    var verifyCheck = panel.add("checkbox", undefined, "Verify candidates at full resolution");
+    verifyCheck.value = true;
+    verifyCheck.helpTip = "Runs a slower second pass only when the fast scan finds frames to remove. Recommended for catching slow motion that resembles a hold.";
     var debugCheck = panel.add("checkbox", undefined, "Debug: mark frames, don't remove");
     debugCheck.helpTip = "Build a comp of the untouched source with a marker on every frame that would be removed, so you can step through and check each one.";
     pluckButton.onClick = function () {
       pluckButton.enabled = false;
       try {
-        runPluck(debugCheck.value);
+        runPluck(debugCheck.value, verifyCheck.value);
       } catch (err) {
         // fail() already alerted before throwing; only surface unexpected errors.
         if (!(err && err.framePluckerHandled)) {
