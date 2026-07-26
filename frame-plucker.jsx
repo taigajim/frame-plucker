@@ -67,6 +67,12 @@
     var tick = String.fromCharCode(96);
     return "\"" + quoted.replace(new RegExp(tick, "g"), "\\" + tick) + "\"";
   }
+  function wrapSystemCommand(command, isWin) {
+    // The host launches a process directly on Windows; redirection is a cmd.exe
+    // feature. /d avoids AutoRun hooks, while /s preserves the nested quoting
+    // required when the executable or temp paths contain spaces.
+    return isWin ? "cmd.exe /d /s /c \"" + command + "\"" : command;
+  }
   function parseDiffMetrics(output) {
     var lines = String(output).split(/\r\n|\r|\n/);
     var metrics = [];
@@ -902,6 +908,10 @@
     return shellQuote(value, isWindows());
   }
 
+  function callSystemCommand(command) {
+    return system.callSystem(wrapSystemCommand(command, isWindows()));
+  }
+
   function getCachedFfmpegPath() {
     try {
       if (app.settings.haveSetting(SETTINGS_SECTION, SETTINGS_FFMPEG_PATH)) {
@@ -925,7 +935,7 @@
 
   function commandWorks(command) {
     try {
-      var output = system.callSystem(aeShellQuote(command) + " -version");
+      var output = callSystemCommand(aeShellQuote(command) + " -version");
       return lowerText(output).match(/ffmpeg version/) !== null;
     } catch (err) {
       return false;
@@ -935,11 +945,24 @@
   function findDefaultFfmpegPath() {
     if (commandWorks("ffmpeg")) return "ffmpeg";
 
-    var candidates = isMac()
-      ? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-      : (isWindows()
-        ? ["C:\\ffmpeg\\bin\\ffmpeg.exe", "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"]
-        : ["/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]);
+    var candidates;
+    if (isMac()) {
+      candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"];
+    } else if (isWindows()) {
+      candidates = [
+        "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+        "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe"
+      ];
+      try {
+        var localAppData = $.getenv("LOCALAPPDATA");
+        var userProfile = $.getenv("USERPROFILE");
+        if (localAppData) candidates.push(localAppData + "\\Microsoft\\WinGet\\Links\\ffmpeg.exe");
+        if (userProfile) candidates.push(userProfile + "\\scoop\\shims\\ffmpeg.exe");
+      } catch (err) {}
+    } else {
+      candidates = ["/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"];
+    }
 
     for (var i = 0; i < candidates.length; i++) {
       try {
@@ -948,7 +971,7 @@
       } catch (err) {}
     }
 
-    return "ffmpeg";
+    return "";
   }
 
   function isNotFoundOutput(output) {
@@ -1126,7 +1149,7 @@
       " 1>" + aeShellQuote(metricsFile.fsName) +
       " 2>" + aeShellQuote(errFile.fsName);
 
-    system.callSystem(command);
+    callSystemCommand(command);
 
     var metricsText = readAndRemove(metricsFile);
     var errText = readAndRemove(errFile);
@@ -1152,7 +1175,7 @@
       " 1>" + aeShellQuote(metricsFile.fsName) +
       " 2>" + aeShellQuote(errFile.fsName);
 
-    system.callSystem(command);
+    callSystemCommand(command);
     return readAndRemove(metricsFile) + "\n" + readAndRemove(errFile);
   }
 
@@ -1168,7 +1191,7 @@
       " 1>" + aeShellQuote(metricsFile.fsName) +
       " 2>" + aeShellQuote(errFile.fsName);
 
-    system.callSystem(command);
+    callSystemCommand(command);
     return readAndRemove(metricsFile) + "\n" + readAndRemove(errFile);
   }
 
@@ -1439,13 +1462,35 @@
     return findDefaultFfmpegPath();
   }
 
-  function makeFfmpegFailureMessage(output, includeDownload) {
-    var message = "ffmpeg could not analyze this clip.\n\nffmpeg said:\n" + lastNonEmptyLines(output, 4);
+  function selectFfmpegExecutable() {
+    var file = isWindows()
+      ? File.openDialog("Locate ffmpeg.exe", "*.exe")
+      : File.openDialog("Locate the ffmpeg executable");
+    if (!file) return "";
+    if (!commandWorks(file.fsName)) {
+      fail("The selected file is not a working ffmpeg executable.\n\nDownload ffmpeg: https://ffmpeg.org/download.html");
+    }
+    saveCachedFfmpegPath(file.fsName);
+    return file.fsName;
+  }
+
+  function makeFfmpegFailureMessage(output, includeDownload, ffmpegPath) {
+    var details = lastNonEmptyLines(output, 4);
+    if (!details) details = "No output was returned.";
+    var message = "ffmpeg could not analyze this clip.\n\nExecutable:\n" +
+      String(ffmpegPath || "unknown") + "\n\nffmpeg said:\n" + details;
     return includeDownload ? message + "\n\nDownload ffmpeg: ffmpeg.org/download.html" : message;
   }
 
   function analyzeSourceWithFfmpeg(sourceRef, frameLimit) {
     var ffmpegPath = getRunFfmpegPath();
+    if (!ffmpegPath) {
+      clearCachedFfmpegPath();
+      ffmpegPath = selectFfmpegExecutable();
+      if (!ffmpegPath) {
+        fail("ffmpeg was not found.\n\nDownload it from https://ffmpeg.org/download.html, then run Frame Plucker and select ffmpeg.exe.");
+      }
+    }
     var output = runFfmpegDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
     var metrics = parseDiffMetrics(output);
     if (metricsCoverExpectedProbe(metrics, frameLimit)) {
@@ -1455,21 +1500,20 @@
 
     if (isNotFoundOutput(output)) {
       clearCachedFfmpegPath();
-      var file = File.openDialog("Locate the ffmpeg executable");
-      if (file) {
-        var retryPath = file.fsName;
+      var retryPath = selectFfmpegExecutable();
+      if (retryPath) {
         var retryOutput = runFfmpegDiffProbe(sourceRef.file, retryPath, frameLimit);
         var retryMetrics = parseDiffMetrics(retryOutput);
         if (metricsCoverExpectedProbe(retryMetrics, frameLimit)) {
           saveCachedFfmpegPath(retryPath);
           return { metrics: retryMetrics, ffmpegPath: retryPath };
         }
-        fail(makeFfmpegFailureMessage(retryOutput, true));
+        fail(makeFfmpegFailureMessage(retryOutput, true, retryPath));
       }
-      fail(makeFfmpegFailureMessage(output, true));
+      fail(makeFfmpegFailureMessage(output, true, ffmpegPath));
     }
 
-    fail(makeFfmpegFailureMessage(output, false));
+    fail(makeFfmpegFailureMessage(output, false, ffmpegPath));
   }
 
   function collectDebugMarks(detection, metrics, includeRawCandidates) {
