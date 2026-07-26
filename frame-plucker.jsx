@@ -908,8 +908,61 @@
     return shellQuote(value, isWindows());
   }
 
+  function makeWindowsRunnerFile() {
+    return new File(
+      Folder.temp.fsName + "/fp_runner_" + (new Date()).getTime() + "_" +
+      Math.floor(Math.random() * 1000000) + ".vbs"
+    );
+  }
+
+  function vbsStringLiteral(value) {
+    return "\"" + String(value).replace(/"/g, "\"\"") + "\"";
+  }
+
   function callSystemCommand(command) {
-    return system.callSystem(wrapSystemCommand(command, isWindows()));
+    if (!isWindows()) return system.callSystem(command);
+
+    // AE's Windows launcher can damage the nested quoting required by cmd.exe,
+    // and a visible console flashes for every probe. Hand the exact command to
+    // WScript instead; it runs cmd hidden, waits for completion, and preserves
+    // the probe's file redirections.
+    var runner = makeWindowsRunnerFile();
+    try {
+      runner.encoding = "UTF-16";
+      if (!runner.open("w")) throw new Error("Could not create the Windows command runner.");
+      runner.write(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\n" +
+        "result = shell.Run(" + vbsStringLiteral(wrapSystemCommand(command, true)) + ", 0, True)\r\n" +
+        "WScript.Quit result\r\n"
+      );
+      runner.close();
+      return system.callSystem("wscript.exe //nologo " + shellQuote(runner.fsName, true));
+    } finally {
+      try { if (runner.opened) runner.close(); } catch (closeErr) {}
+      try { if (runner.exists) runner.remove(); } catch (removeErr) {}
+    }
+  }
+
+  function requireScriptFileAccess() {
+    var allowed = false;
+    try {
+      allowed = app.preferences.getPrefAsLong(
+        "Main Pref Section",
+        "Pref_SCRIPTING_FILE_NETWORK_SECURITY"
+      ) === 1;
+    } catch (err) {}
+    if (allowed) return;
+
+    alert(
+      "Frame Plucker needs permission to run ffmpeg.\n\n" +
+      "Enable Allow Scripts to Write Files and Access Network in " +
+      "Scripting & Expressions, then run Frame Plucker again.",
+      "Frame Plucker"
+    );
+    try { app.executeCommand(3131); } catch (openPrefsErr) {}
+    var permissionError = new Error("After Effects script file access is disabled.");
+    permissionError.framePluckerHandled = true;
+    throw permissionError;
   }
 
   function getCachedFfmpegPath() {
@@ -933,35 +986,14 @@
     } catch (err) {}
   }
 
-  function commandWorks(command) {
-    var outputFile = makeTempFile("ffmpeg_version");
-    try {
-      // AE on Windows can return an empty string from system.callSystem() even
-      // when the child process ran successfully. Capture through a file, as the
-      // analysis probes do, so PATH and manually selected executables are
-      // validated from ffmpeg's actual output.
-      callSystemCommand(
-        aeShellQuote(command) + " -version" +
-        " 1>" + aeShellQuote(outputFile.fsName) +
-        " 2>&1"
-      );
-      var output = readAndRemove(outputFile);
-      return lowerText(output).match(/ffmpeg version/) !== null;
-    } catch (err) {
-      readAndRemove(outputFile);
-      return false;
-    }
-  }
-
   function findDefaultFfmpegPath() {
-    if (commandWorks("ffmpeg")) return "ffmpeg";
-
     var candidates;
     if (isMac()) {
       candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"];
     } else if (isWindows()) {
       candidates = [
         "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        "C:\\Program Files\\ffmpeg\\ffmpeg.exe",
         "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
         "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe"
       ];
@@ -978,19 +1010,11 @@
     for (var i = 0; i < candidates.length; i++) {
       try {
         var candidate = new File(candidates[i]);
-        if (candidate.exists && commandWorks(candidate.fsName)) return candidate.fsName;
+        if (candidate.exists) return candidate.fsName;
       } catch (err) {}
     }
 
     return "";
-  }
-
-  function isNotFoundOutput(output) {
-    var text = lowerText(output);
-    return text.match(/not found/) !== null ||
-      text.match(/no such file/) !== null ||
-      text.match(/not recognized/) !== null ||
-      text.match(/cannot find/) !== null;
   }
 
   function isFileBackedSource(item) {
@@ -1164,9 +1188,8 @@
 
     var metricsText = readAndRemove(metricsFile);
     var errText = readAndRemove(errFile);
-    // parseDiffMetrics reads the metadata lines; isNotFoundOutput and the
-    // failure messages read ffmpeg's stderr. Returning both keeps every caller
-    // working against a single string, as before.
+    // parseDiffMetrics reads the metadata lines, while failure messages read
+    // ffmpeg's stderr. Returning both keeps every caller on one result string.
     return metricsText + "\n" + errText;
   }
 
@@ -1462,26 +1485,14 @@
     return message + "This clip plays like genuine " + fps + " fps motion - nothing to remove.";
   }
 
-  function getRunFfmpegPath() {
-    // PATH always wins, on every run and on both Mac and Windows: a pro user's
-    // own ffmpeg is preferred over a cached manually selected path, and if they
-    // install ffmpeg later we pick it up automatically. This probe is at pluck
-    // time, so the panel still opens instantly.
-    if (commandWorks("ffmpeg")) return "ffmpeg";
-    var cached = getCachedFfmpegPath();
-    if (cached && commandWorks(cached)) return cached;
-    return findDefaultFfmpegPath();
-  }
-
   function selectFfmpegExecutable() {
     var file = isWindows()
       ? File.openDialog("Locate ffmpeg.exe", "*.exe")
       : File.openDialog("Locate the ffmpeg executable");
     if (!file) return "";
-    if (!commandWorks(file.fsName)) {
-      fail("The selected file is not a working ffmpeg executable.\n\nDownload ffmpeg: https://ffmpeg.org/download.html");
-    }
-    saveCachedFfmpegPath(file.fsName);
+    // The real analysis probe is the authoritative validation. In particular,
+    // AE 2025 on Windows may not expose output from a successful `-version`
+    // probe, which would incorrectly reject a user-selected ffmpeg.exe.
     return file.fsName;
   }
 
@@ -1493,38 +1504,63 @@
     return includeDownload ? message + "\n\nDownload ffmpeg: ffmpeg.org/download.html" : message;
   }
 
-  function analyzeSourceWithFfmpeg(sourceRef, frameLimit) {
-    var ffmpegPath = getRunFfmpegPath();
-    if (!ffmpegPath) {
-      clearCachedFfmpegPath();
-      ffmpegPath = selectFfmpegExecutable();
-      if (!ffmpegPath) {
-        fail("ffmpeg was not found.\n\nDownload it from https://ffmpeg.org/download.html, then run Frame Plucker and select ffmpeg.exe.");
-      }
+  function failIfAeDeniedSystemAccess(output) {
+    var text = lowerText(output);
+    if (text.match(/referenceerror:\s*permission denied/) !== null ||
+        (text.match(/permission denied/) !== null &&
+         text.match(/allow scripts to write files and access network/) !== null)) {
+      fail(
+        "After Effects blocked Frame Plucker from running ffmpeg.\n\n" +
+        "Enable Edit > Preferences > Scripting & Expressions > " +
+        "Allow Scripts to Write Files and Access Network, then restart After Effects."
+      );
     }
-    var output = runFfmpegDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
+  }
+
+  function tryFfmpegAnalysis(sourceRef, frameLimit, ffmpegPath) {
+    var output;
+    try {
+      output = runFfmpegDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
+    } catch (err) {
+      output = String(err);
+    }
     var metrics = parseDiffMetrics(output);
-    if (metricsCoverExpectedProbe(metrics, frameLimit)) {
-      saveCachedFfmpegPath(ffmpegPath);
-      return { metrics: metrics, ffmpegPath: ffmpegPath };
-    }
+    return {
+      output: output,
+      metrics: metrics,
+      complete: metricsCoverExpectedProbe(metrics, frameLimit)
+    };
+  }
 
-    if (isNotFoundOutput(output)) {
-      clearCachedFfmpegPath();
-      var retryPath = selectFfmpegExecutable();
-      if (retryPath) {
-        var retryOutput = runFfmpegDiffProbe(sourceRef.file, retryPath, frameLimit);
-        var retryMetrics = parseDiffMetrics(retryOutput);
-        if (metricsCoverExpectedProbe(retryMetrics, frameLimit)) {
-          saveCachedFfmpegPath(retryPath);
-          return { metrics: retryMetrics, ffmpegPath: retryPath };
-        }
-        fail(makeFfmpegFailureMessage(retryOutput, true, retryPath));
+  function analyzeSourceWithFfmpeg(sourceRef, frameLimit) {
+    var paths = ["ffmpeg"];
+    var cached = getCachedFfmpegPath();
+    var fallback = findDefaultFfmpegPath();
+    if (cached && lowerText(cached) !== "ffmpeg") paths.push(cached);
+    if (fallback && lowerText(fallback) !== lowerText(cached)) paths.push(fallback);
+
+    for (var i = 0; i < paths.length; i++) {
+      var attempt = tryFfmpegAnalysis(sourceRef, frameLimit, paths[i]);
+      failIfAeDeniedSystemAccess(attempt.output);
+      if (attempt.complete) {
+        if (paths[i] !== "ffmpeg") saveCachedFfmpegPath(paths[i]);
+        return { metrics: attempt.metrics, ffmpegPath: paths[i] };
       }
-      fail(makeFfmpegFailureMessage(output, true, ffmpegPath));
     }
 
-    fail(makeFfmpegFailureMessage(output, false, ffmpegPath));
+    clearCachedFfmpegPath();
+    var selectedPath = selectFfmpegExecutable();
+    if (!selectedPath) {
+      fail("ffmpeg was not found.\n\nDownload it from https://ffmpeg.org/download.html, then run Frame Plucker and select ffmpeg.exe.");
+    }
+
+    var selectedAttempt = tryFfmpegAnalysis(sourceRef, frameLimit, selectedPath);
+    failIfAeDeniedSystemAccess(selectedAttempt.output);
+    if (selectedAttempt.complete) {
+      saveCachedFfmpegPath(selectedPath);
+      return { metrics: selectedAttempt.metrics, ffmpegPath: selectedPath };
+    }
+    fail(makeFfmpegFailureMessage(selectedAttempt.output, true, selectedPath));
   }
 
   function collectDebugMarks(detection, metrics, includeRawCandidates) {
@@ -1595,6 +1631,7 @@
   }
 
   function runPluck(debug, verifyFullResolution, includeRawCandidates, allowOtherFrameRates) {
+    requireScriptFileAccess();
     var sourceRef = resolveSourceRef();
     validateSourceRef(sourceRef);
     var fps = getSourceFrameRate(sourceRef);
