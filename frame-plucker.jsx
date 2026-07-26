@@ -32,9 +32,20 @@
   var SCATTER_MIN_DUPS = 2;
   var SCATTER_MAX_FRACTION = 0.2;
   var SCATTER_GAP_RATIO = 3;
+  // Some edited clips contain several generated shots whose held-frame signal
+  // is locally sharp but disappears into the whole-clip motion distribution.
+  // This fallback looks for a repeating phase of two-sided temporal dips, then
+  // requires full-resolution verification before any of them can be removed.
+  var LOCAL_DIP_CONTRAST = 2.5;
+  var LOCAL_DIP_PHASE_RATE = 0.8;
+  var LOCAL_DIP_MAX_RESIDUAL = 0.1;
+  var LOCAL_DIP_MAX_PHASES = 1;
   // A 4fps-in-24 cadence creates runs of 5 duplicates and remains cadence evidence;
   // runs of 6+ are treated as freeze holds, so lower content rates are out of scope.
   var FREEZE_MIN_RUN = 6;
+  // A short run at the exact start/end is commonly a boundary hold rather than
+  // cadence evidence. Exclude it so it cannot veto an otherwise safe drift.
+  var BOUNDARY_FREEZE_MIN_RUN = 3;
   // A real freeze can briefly rise above the duplicate cutoff for a frame or two
   // (codec flicker), splitting one hold into a freeze + a short run + a freeze.
   // Short duplicate runs within this many motion frames of a freeze are absorbed
@@ -42,6 +53,12 @@
   // genuine cadence duplicate 3+ frames before a freeze onset is left alone.
   var FREEZE_MERGE_GAP = 2;
   var FULL_RES_SSIM_MIN = 0.9925;
+  // Temporal-stall recovery may relax the near-identical SSIM threshold, but
+  // never enough to remove a visibly different frame.
+  var FULL_RES_TEMPORAL_SSIM_FLOOR = 0.98;
+  var FULL_RES_TEMPORAL_CONTRAST = 4;
+  var NATIVE_FPS_TARGET = 24;
+  var NATIVE_FPS_TOLERANCE = 0.05;
   function shellQuote(value, isWin) {
     var text = String(value);
     if (isWin) {
@@ -227,7 +244,20 @@
     {
       var isFreeze = [];
       var r;
-      for (r = 0; r < runs.length; r++) isFreeze[r] = runs[r].length >= FREEZE_MIN_RUN;
+      var maxInteriorRun = 0;
+      for (r = 0; r < runs.length; r++) {
+        var isBoundaryRun = runs[r].startIndex === 0 ||
+          runs[r].startIndex + runs[r].length === metrics.length;
+        if (!isBoundaryRun && runs[r].length > maxInteriorRun) maxInteriorRun = runs[r].length;
+      }
+      for (r = 0; r < runs.length; r++) {
+        var touchesBoundary = runs[r].startIndex === 0 ||
+          runs[r].startIndex + runs[r].length === metrics.length;
+        isFreeze[r] = runs[r].length >= FREEZE_MIN_RUN ||
+          (touchesBoundary &&
+            runs[r].length >= BOUNDARY_FREEZE_MIN_RUN &&
+            runs[r].length > maxInteriorRun);
+      }
 
       // Absorb short duplicate runs that are freeze flicker (within
       // FREEZE_MERGE_GAP motion frames of a freeze). Iterate so a flicker run
@@ -274,14 +304,22 @@
         if (spanStart >= 0) {
           // A metric at frame n describes the transition from source frame n
           // to source frame n+1. Preserve both ends of a freeze transition span.
-          freezes.push({ start: metrics[spanStart].frame, length: metrics[i - 1].frame - metrics[spanStart].frame + 2 });
+          freezes.push({
+            start: metrics[spanStart].frame,
+            length: metrics[i - 1].frame - metrics[spanStart].frame + 2,
+            boundary: spanStart === 0
+          });
           spanStart = -1;
         }
         working.push(metrics[i]);
       }
     }
     if (spanStart >= 0) {
-      freezes.push({ start: metrics[spanStart].frame, length: metrics[metrics.length - 1].frame - metrics[spanStart].frame + 2 });
+      freezes.push({
+        start: metrics[spanStart].frame,
+        length: metrics[metrics.length - 1].frame - metrics[spanStart].frame + 2,
+        boundary: true
+      });
     }
 
     return { working: working, freezes: freezes };
@@ -556,6 +594,100 @@
     return { hasCadence: true, mode: "scattered", dupFrames: dupFrames, confidence: "medium", analysis: analysis };
   }
 
+  function collectLocalDipFrames(metrics, analysis) {
+    var frames = [];
+    for (var i = 1; i < metrics.length - 1; i++) {
+      var previous = metrics[i - 1];
+      var current = metrics[i];
+      var next = metrics[i + 1];
+      if (previous.frame + 1 !== current.frame || current.frame + 1 !== next.frame) continue;
+      if (!isDuplicateMetric(current, analysis)) continue;
+      if (current.value * LOCAL_DIP_CONTRAST <= Math.min(previous.value, next.value)) {
+        frames.push(current.frame);
+      }
+    }
+    return frames;
+  }
+
+  function detectLocalDipCadence(metrics) {
+    var analysis = analyzeDuplicateClass(metrics);
+    var dipFrames = collectLocalDipFrames(metrics, analysis);
+    var best = null;
+
+    for (var period = PERIOD_MIN; period <= PERIOD_MAX; period++) {
+      var counts = [];
+      var dipCounts = [];
+      var phase;
+      for (phase = 0; phase < period; phase++) {
+        counts[phase] = 0;
+        dipCounts[phase] = 0;
+      }
+      for (var i = 0; i < metrics.length; i++) {
+        phase = ((metrics[i].frame % period) + period) % period;
+        counts[phase]++;
+      }
+      for (var j = 0; j < dipFrames.length; j++) {
+        phase = ((dipFrames[j] % period) + period) % period;
+        dipCounts[phase]++;
+      }
+
+      var phases = [];
+      var selectedCount = 0;
+      var minimumRate = 1;
+      for (phase = 0; phase < period; phase++) {
+        if (counts[phase] < MIN_PHASE_SAMPLES) continue;
+        var rate = dipCounts[phase] / counts[phase];
+        if (rate >= LOCAL_DIP_PHASE_RATE) {
+          phases.push(phase);
+          selectedCount += dipCounts[phase];
+          if (rate < minimumRate) minimumRate = rate;
+        }
+      }
+      if (!phases.length || phases.length > LOCAL_DIP_MAX_PHASES) continue;
+      if (selectedCount < MIN_PHASE_SAMPLES) continue;
+      if (dipFrames.length && (dipFrames.length - selectedCount) / dipFrames.length > LOCAL_DIP_MAX_RESIDUAL) continue;
+
+      var result = {
+        period: period,
+        phases: phases,
+        selectedCount: selectedCount,
+        rate: minimumRate
+      };
+      if (!best ||
+          result.selectedCount > best.selectedCount ||
+          (result.selectedCount === best.selectedCount && result.rate > best.rate) ||
+          (result.selectedCount === best.selectedCount && result.rate === best.rate && result.period < best.period)) {
+        best = result;
+      }
+    }
+
+    if (!best) {
+      return {
+        hasCadence: false,
+        reason: "local_dip_no_period",
+        analysis: analysis,
+        localDipFrames: dipFrames
+      };
+    }
+
+    var selectedFrames = [];
+    for (var k = 0; k < dipFrames.length; k++) {
+      var selectedPhase = ((dipFrames[k] % best.period) + best.period) % best.period;
+      if (phaseListContains(best.phases, selectedPhase)) selectedFrames.push(dipFrames[k]);
+    }
+    return {
+      hasCadence: true,
+      mode: "scattered",
+      dupFrames: selectedFrames,
+      confidence: "medium",
+      analysis: analysis,
+      localDipPeriod: best.period,
+      localDipPhases: best.phases,
+      localDipCandidateCount: selectedFrames.length,
+      freezes: []
+    };
+  }
+
   function detectLockedCadence(metrics, maxPhases, periodOverride, analysis) {
     var periodResult;
     if (periodOverride) {
@@ -651,6 +783,16 @@
     }
     return keepFrames;
   }
+  function buildKeepFramesFromSourceList(frameCount, sourceFrames, srcStartFrame) {
+    var keepFrames = [];
+    var startFrame = srcStartFrame || 0;
+    var removeLookup = {};
+    for (var i = 0; i < sourceFrames.length; i++) removeLookup[sourceFrames[i]] = true;
+    for (var frame = 0; frame < frameCount; frame++) {
+      if (!removeLookup[startFrame + frame]) keepFrames.push(frame);
+    }
+    return keepFrames;
+  }
   function candidateTransitionsForDetection(detection, metrics) {
     var candidates = [];
     var i;
@@ -667,20 +809,42 @@
     }
     return candidates;
   }
-  function verifyDetectionWithSsim(detection, metrics, ssimMetrics, minimum) {
+  function verifyDetectionWithSsim(detection, metrics, ssimMetrics, minimum, fullResDiffMetrics, temporalContrastMinimum) {
     var lookup = {};
     for (var i = 0; i < ssimMetrics.length; i++) lookup[ssimMetrics[i].frame] = ssimMetrics[i].value;
+    var diffLookup = {};
+    if (fullResDiffMetrics) {
+      for (var diffIndex = 0; diffIndex < fullResDiffMetrics.length; diffIndex++) {
+        diffLookup[fullResDiffMetrics[diffIndex].frame] = fullResDiffMetrics[diffIndex].value;
+      }
+    }
 
     var candidates = candidateTransitionsForDetection(detection, metrics);
     var confirmed = [];
     var rejected = [];
     var missing = [];
+    var temporalConfirmedCount = 0;
     for (var j = 0; j < candidates.length; j++) {
       var value = lookup[candidates[j]];
+      var temporalConfirmed = false;
+      if (detection.localDipPeriod && fullResDiffMetrics && temporalContrastMinimum) {
+        var previousDiff = diffLookup[candidates[j] - 1];
+        var currentDiff = diffLookup[candidates[j]];
+        var nextDiff = diffLookup[candidates[j] + 1];
+        if (value !== undefined &&
+            value >= FULL_RES_TEMPORAL_SSIM_FLOOR &&
+            previousDiff !== undefined &&
+            currentDiff !== undefined &&
+            nextDiff !== undefined &&
+            currentDiff > 0) {
+          temporalConfirmed = Math.min(previousDiff, nextDiff) / currentDiff >= temporalContrastMinimum;
+        }
+      }
       if (value === undefined) {
         missing.push(candidates[j]);
-      } else if (value >= minimum) {
+      } else if (value >= minimum || temporalConfirmed) {
         confirmed.push(candidates[j]);
+        if (value < minimum && temporalConfirmed) temporalConfirmedCount++;
       } else {
         rejected.push(candidates[j]);
       }
@@ -691,6 +855,7 @@
     detection.fullResRejectedCount = rejected.length;
     detection.fullResMissingCount = missing.length;
     detection.verifiedDupFrames = confirmed;
+    detection.temporalMotionConfirmedCount = temporalConfirmedCount;
 
     if (missing.length || confirmed.length < 2) {
       detection.hasCadence = false;
@@ -709,6 +874,9 @@
       if (metrics[i].frame !== metrics[i - 1].frame + 1) return false;
     }
     return true;
+  }
+  function isSupportedNativeFrameRate(fps) {
+    return isFinite(fps) && Math.abs(fps - NATIVE_FPS_TARGET) <= NATIVE_FPS_TOLERANCE;
   }
 // === CORE END ===
 
@@ -952,6 +1120,27 @@
     return collected.refs[resolved.index];
   }
 
+  function resolveMarkedLayerSourceRef() {
+    var activeItem = app.project.activeItem;
+    if (!(activeItem instanceof CompItem)) {
+      fail("Open a comp and select one file-backed video layer containing the frame markers to pluck.");
+    }
+    var selectedLayers = activeItem.selectedLayers || [];
+    if (selectedLayers.length !== 1) {
+      fail("Select exactly one video layer containing the frame markers to pluck.");
+    }
+    var layer = selectedLayers[0];
+    if (!(layer instanceof AVLayer) || !isFileBackedSource(layer.source)) {
+      fail("The selected layer must be a file-backed video layer.");
+    }
+    var markerProp = layer.property("ADBE Marker");
+    if (!markerProp) markerProp = layer.property("Marker");
+    if (!markerProp || markerProp.numKeys < 1) {
+      fail("The selected layer has no layer markers to pluck.");
+    }
+    return { sourceRef: sourceRefFromLayer(layer, activeItem), markerProp: markerProp };
+  }
+
   function validateSourceRef(sourceRef) {
     if (sourceRef.layer) {
       if (Math.abs(sourceRef.layer.stretch - 100) > 0.01 || sourceRef.layer.timeRemapEnabled) fail("Stretched or time-remapped layers are not supported. Select the footage item in the Project panel instead.");
@@ -966,6 +1155,15 @@
   function getSourceFrameRate(sourceRef) {
     if (sourceRef.layer && sourceRef.comp) return sourceRef.comp.frameRate;
     return sourceRef.source ? sourceRef.source.frameRate : 0;
+  }
+
+  function validateRunFrameRate(fps, allowOtherFrameRates) {
+    if (!isFinite(fps) || fps <= 0) fail("Could not determine a positive source frame rate.");
+    if (!isSupportedNativeFrameRate(fps) && !allowOtherFrameRates) {
+      fail("Frame Plucker is designed for native 24 fps AI clips.\n\n" +
+        "This source is " + String(Math.round(fps * 1000) / 1000) + " fps and may have been frame-rate converted. " +
+        "Use the original native 24 fps file, or enable Allow non-24 fps sources if you understand that removing frames can change playback speed.");
+    }
   }
 
   function getProbeFrameCount(sourceRef, fps) {
@@ -1053,11 +1251,36 @@
     return readAndRemove(metricsFile) + "\n" + readAndRemove(errFile);
   }
 
+  function runFfmpegFullResDiffProbe(file, ffmpegPath, frameLimit) {
+    var metricsFile = makeTempFile("full_diff");
+    var errFile = makeTempFile("full_diff_err");
+    var filter = "select=lt(n\\," + frameLimit + "),tblend=all_mode=difference,signalstats,metadata=print:file=-:key=lavfi.signalstats.YAVG";
+    var command = aeShellQuote(ffmpegPath) +
+      " -hide_banner -v error -i " + aeShellQuote(file.fsName) +
+      " -vf " + aeShellQuote(filter) +
+      " -frames:v " + frameLimit +
+      " -an -f null -" +
+      " 1>" + aeShellQuote(metricsFile.fsName) +
+      " 2>" + aeShellQuote(errFile.fsName);
+
+    system.callSystem(command);
+    return readAndRemove(metricsFile) + "\n" + readAndRemove(errFile);
+  }
+
   function analyzeSourceSsimWithFfmpeg(sourceRef, ffmpegPath, frameLimit) {
     var output = runFfmpegSsimProbe(sourceRef.file, ffmpegPath, frameLimit);
     var metrics = parseSsimMetrics(output);
     if (!metricsCoverExpectedProbe(metrics, frameLimit)) {
       fail("Full-resolution verification did not cover the complete analyzed range.\n\nffmpeg said:\n" + lastNonEmptyLines(output, 4));
+    }
+    return metrics;
+  }
+
+  function analyzeSourceFullResDiffWithFfmpeg(sourceRef, ffmpegPath, frameLimit) {
+    var output = runFfmpegFullResDiffProbe(sourceRef.file, ffmpegPath, frameLimit);
+    var metrics = parseDiffMetrics(output);
+    if (!metricsCoverExpectedProbe(metrics, frameLimit)) {
+      fail("Full-resolution motion analysis did not cover the complete analyzed range.\n\nffmpeg said:\n" + lastNonEmptyLines(output, 4));
     }
     return metrics;
   }
@@ -1074,10 +1297,75 @@
     return frameIndex / fps;
   }
 
+  function collectMarkedSourceFrames(sourceRef, markerProp, fps, srcStartFrame, visibleFrameCount) {
+    var frames = [];
+    var lookup = {};
+    for (var keyIndex = 1; keyIndex <= markerProp.numKeys; keyIndex++) {
+      var markerTime = markerProp.keyTime(keyIndex);
+      var sourceTime;
+      try {
+        sourceTime = sourceRef.layer.sourceTime(markerTime);
+      } catch (err) {
+        sourceTime = markerTime - sourceRef.layer.startTime;
+      }
+      var exactFrame = sourceTime * fps;
+      var sourceFrame = Math.round(exactFrame);
+      if (Math.abs(exactFrame - sourceFrame) > 0.1) {
+        fail("A layer marker at " + String(Math.round(markerTime * 1000) / 1000) +
+          " seconds falls between source frames. Align every removal marker to a frame boundary.");
+      }
+      if (sourceFrame < srcStartFrame || sourceFrame >= srcStartFrame + visibleFrameCount) {
+        fail("A layer marker points outside the visible source range. Keep removal markers between the selected layer's in and out points.");
+      }
+      if (!lookup[sourceFrame]) {
+        lookup[sourceFrame] = true;
+        frames.push(sourceFrame);
+      }
+    }
+    frames.sort(function (a, b) { return a - b; });
+    return frames;
+  }
+
   function setHoldKeys(property) {
     for (var keyIndex = 1; keyIndex <= property.numKeys; keyIndex++) {
       property.setInterpolationTypeAtKey(keyIndex, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
     }
+  }
+
+  function createCleanComp(sourceRef, fps, keepFrames, cleanName, layerName, summary) {
+    var cleanDuration = keepFrames.length / fps;
+    var cleanComp = app.project.items.addComp(
+      cleanName,
+      sourceRef.width,
+      sourceRef.height,
+      sourceRef.pixelAspect,
+      cleanDuration,
+      fps
+    );
+    cleanComp.bgColor = sourceRef.bgColor;
+
+    var cleanLayer = cleanComp.layers.add(sourceRef.source);
+    cleanLayer.name = layerName;
+    cleanLayer.startTime = 0;
+    cleanLayer.inPoint = 0;
+    cleanLayer.outPoint = cleanDuration;
+    cleanLayer.audioEnabled = false;
+    cleanLayer.timeRemapEnabled = true;
+
+    var remap = cleanLayer.property("ADBE Time Remapping");
+    for (var i = 0; i < keepFrames.length; i++) {
+      remap.setValueAtTime(i / fps, getOriginalSourceTime(sourceRef, keepFrames[i], fps));
+    }
+    remap.setValueAtTime(cleanDuration, getOriginalSourceTime(sourceRef, keepFrames[keepFrames.length - 1], fps));
+    setHoldKeys(remap);
+
+    cleanComp.markerProperty.setValueAtTime(0, new MarkerValue(summary));
+    cleanComp.openInViewer();
+    try {
+      cleanLayer.selected = true;
+      remap.selected = true;
+    } catch (err) {}
+    return cleanComp;
   }
 
   function uniqueCompName(baseName) {
@@ -1119,7 +1407,8 @@
     var text = "";
     if (!detection.freezes) return text;
     for (var i = 0; i < detection.freezes.length; i++) {
-      text += "; freeze " + detection.freezes[i].start + "+" + detection.freezes[i].length;
+      text += detection.freezes[i].boundary ? "; boundary span " : "; freeze ";
+      text += detection.freezes[i].start + "+" + detection.freezes[i].length;
     }
     return text;
   }
@@ -1128,7 +1417,9 @@
     var text = "";
     if (!detection.freezes) return text;
     for (var i = 0; i < detection.freezes.length; i++) {
-      text += "Kept: " + detection.freezes[i].length + "-frame freeze at frame " + detection.freezes[i].start + "\n";
+      text += "Kept: " + detection.freezes[i].length + "-frame " +
+        (detection.freezes[i].boundary ? "boundary low-motion span" : "freeze") +
+        " at frame " + detection.freezes[i].start + "\n";
     }
     return text;
   }
@@ -1139,6 +1430,11 @@
       return "Created " + name + ". Detected a drifting hold cadence: removed " + removed + " duplicate frames (~1 every " + detection.medianGap + "). Confidence: " + detection.confidence + "." + freezeSuffix;
     }
     if (detection.mode === "scattered") {
+      if (detection.localDipPeriod) {
+        return "Created " + name + ". Removed " + removed +
+          " full-resolution-verified held frame(s) from a local " + detection.localDipPeriod +
+          "-frame candidate pattern. Confidence: " + detection.confidence + "." + freezeSuffix;
+      }
       return "Created " + name + ". Removed " + removed + " isolated held frame(s); no repeating cadence in the rest of the clip. Confidence: " + detection.confidence + "." + freezeSuffix;
     }
     return "Created " + name + ". Detected " + detection.phases.length + " duplicate frame(s) every " + detection.period + " - the clip is effectively " + formatEffectiveFps(fps, detection.period, detection.phases.length) + " fps content. Removed " + removed + " of " + frameCount + " frames. Confidence: " + detection.confidence + ". Phases: " + phasesToText(detection.phases) + "." + freezeSuffix;
@@ -1162,8 +1458,12 @@
     }
     if (detection.mode === "scattered") {
       var scatteredCount = detection.verifiedDupFrames ? detection.verifiedDupFrames.length : detection.dupFrames.length;
+      var scatteredHead = detection.localDipPeriod
+        ? "Found " + scatteredCount + " held frame(s) verified inside a repeating local " +
+          detection.localDipPeriod + "-frame candidate pattern.\n"
+        : "Found " + scatteredCount + " isolated held frame(s); no repeating cadence elsewhere.\n";
       return "Clean comp created:\n" + name + "\n\n" +
-        "Found " + scatteredCount + " isolated held frame(s); no repeating cadence elsewhere.\n" +
+        scatteredHead +
         "Removed: " + removed + " of " + frameCount + " frames (" + pct + "%)\n" +
         verificationLine +
         freezeLines +
@@ -1192,8 +1492,11 @@
     }
     if (detection.mode === "scattered") {
       var scatterFrames = detection.verifiedDupFrames || detection.dupFrames;
-      return "No repeating cadence, but " + scatterFrames.length +
-        " isolated held frame(s) were verified\n" +
+      var scatterHead = detection.localDipPeriod
+        ? "A repeating local " + detection.localDipPeriod + "-frame candidate pattern produced " +
+          scatterFrames.length + " full-resolution-verified held frame(s)\n"
+        : "No repeating cadence, but " + scatterFrames.length + " isolated held frame(s) were verified\n";
+      return scatterHead +
         "(first at frame " + (scatterFrames[0] + 1) + ").\n" +
         verificationLine + "\n" +
         "Remove just those frames?";
@@ -1276,12 +1579,17 @@
     fail(makeFfmpegFailureMessage(output, false));
   }
 
-  function collectDebugMarks(detection, metrics) {
-    // Source frames the pluck would remove. When no cadence was found, fall back
-    // to the raw duplicate candidates so a false negative is still inspectable.
+  function collectDebugMarks(detection, metrics, includeRawCandidates) {
+    // Source frames the pluck would actually remove. Rejected low-resolution
+    // candidates are shown only through the explicit diagnostic option; they
+    // must never look like accepted removals by default.
     var frames = [];
     var i, phase;
-    if (detection.hasCadence && detection.verifiedDupFrames) {
+    if (includeRawCandidates && detection.analysis) {
+      for (i = 0; i < metrics.length; i++) {
+        if (metrics[i].value <= detection.analysis.cutoff) frames.push(metrics[i].frame + 1);
+      }
+    } else if (detection.hasCadence && detection.verifiedDupFrames) {
       for (i = 0; i < detection.verifiedDupFrames.length; i++) frames.push(detection.verifiedDupFrames[i] + 1);
     } else if (detection.hasCadence && detection.mode === "locked") {
       for (i = 0; i < metrics.length; i++) {
@@ -1290,20 +1598,19 @@
       }
     } else if (detection.hasCadence) {
       for (i = 0; i < detection.dupFrames.length; i++) frames.push(detection.dupFrames[i] + 1);
-    } else if (detection.analysis) {
-      for (i = 0; i < metrics.length; i++) {
-        if (metrics[i].value <= detection.analysis.cutoff) frames.push(metrics[i].frame + 1);
-      }
     }
     return frames;
   }
 
-  function buildDebugComp(sourceRef, fps, frameCount, frames) {
-    var name = uniqueCompName(sourceRef.baseName + "_ffmpeg_DEBUG_marks");
+  function buildDebugComp(sourceRef, fps, frameCount, frames, rawCandidates) {
+    var suffix = rawCandidates ? "_ffmpeg_DIAGNOSTIC_raw" : "_ffmpeg_DEBUG_marks";
+    var name = uniqueCompName(sourceRef.baseName + suffix);
     var comp = app.project.items.addComp(name, sourceRef.width, sourceRef.height, sourceRef.pixelAspect, frameCount / fps, fps);
     comp.bgColor = sourceRef.bgColor;
     var layer = comp.layers.add(sourceRef.source);
-    layer.name = sourceRef.name + " (debug: nothing removed)";
+    layer.name = sourceRef.name + (rawCandidates
+      ? " (diagnostic raw candidates; nothing removed)"
+      : " (debug removals; nothing removed)");
     layer.startTime = 0;
     layer.audioEnabled = false;
     var markerProp = layer.property("Marker");
@@ -1314,8 +1621,11 @@
     return name;
   }
 
-  function makeDebugMessage(detection, marks, name) {
+  function makeDebugMessage(detection, marks, name, rawCandidates) {
     var head = "DEBUG - nothing removed.\n\nMarked " + marks.length + " frame(s) on:\n" + name + "\n\n";
+    if (rawCandidates) {
+      return head + "These are rejected/unverified low-resolution candidates for diagnostic inspection. They are not the set normal mode would remove.";
+    }
     if (detection.hasCadence) {
       if (detection.fullResVerified) {
         return head + "Full-resolution verification would remove " + detection.verifiedDupFrames.length +
@@ -1330,14 +1640,17 @@
       }
       return head + "Would remove " + (detection.dupFrames ? detection.dupFrames.length : marks.length) + " isolated held frame(s).";
     }
-    return head + "No cadence (" + (detection.reason || "unknown") + "). Marks show the raw duplicate candidates the metric found.";
+    if (marks.length) {
+      return head + "No cadence (" + (detection.reason || "unknown") + "). These are rejected raw candidates for diagnostic inspection, not frames normal mode would remove.";
+    }
+    return head + "No cadence (" + (detection.reason || "unknown") + "). Normal mode would remove nothing, so no frames were marked.";
   }
 
-  function runPluck(debug, verifyFullResolution) {
+  function runPluck(debug, verifyFullResolution, includeRawCandidates, allowOtherFrameRates) {
     var sourceRef = resolveSourceRef();
     validateSourceRef(sourceRef);
     var fps = getSourceFrameRate(sourceRef);
-    if (!isFinite(fps) || fps <= 0) fail("Could not determine a positive source frame rate.");
+    validateRunFrameRate(fps, allowOtherFrameRates);
 
     var probeFrameCount = getProbeFrameCount(sourceRef, fps);
     writeLn("Frame Plucker: analyzing " + sourceRef.name + " (" + probeFrameCount + " frames)...");
@@ -1347,10 +1660,27 @@
     var metrics = analysisResult.metrics;
 
     var detection = detectCadence(metrics, MAX_PHASES, 0);
+    if (verifyFullResolution && !detection.hasCadence) {
+      // Do not loosen the normal whole-clip detector. A local-dip fallback is
+      // eligible only when it finds a strong repeating phase and every eventual
+      // removal will be checked at full resolution below.
+      var localDipDetection = detectLocalDipCadence(metrics);
+      if (localDipDetection.hasCadence) detection = localDipDetection;
+    }
     if (verifyFullResolution && detection.hasCadence) {
       writeLn("Frame Plucker: verifying candidates at full resolution...");
       var ssimMetrics = analyzeSourceSsimWithFfmpeg(sourceRef, analysisResult.ffmpegPath, probeFrameCount);
-      detection = verifyDetectionWithSsim(detection, metrics, ssimMetrics, FULL_RES_SSIM_MIN);
+      var fullResDiffMetrics = detection.localDipPeriod
+        ? analyzeSourceFullResDiffWithFfmpeg(sourceRef, analysisResult.ffmpegPath, probeFrameCount)
+        : null;
+      detection = verifyDetectionWithSsim(
+        detection,
+        metrics,
+        ssimMetrics,
+        FULL_RES_SSIM_MIN,
+        fullResDiffMetrics,
+        FULL_RES_TEMPORAL_CONTRAST
+      );
       writeLn("Frame Plucker: full-resolution verification done.");
     }
 
@@ -1358,15 +1688,15 @@
       // Mark what would be removed on a full-length copy of the source; remove
       // nothing. Short-circuits confirms and comp creation so any detection
       // (including "no cadence") is inspectable frame by frame.
-      var marks = collectDebugMarks(detection, metrics);
+      var marks = collectDebugMarks(detection, metrics, includeRawCandidates);
       app.beginUndoGroup("Frame Plucker Debug");
       var debugName;
       try {
-        debugName = buildDebugComp(sourceRef, fps, probeFrameCount, marks);
+        debugName = buildDebugComp(sourceRef, fps, probeFrameCount, marks, includeRawCandidates);
       } finally {
         app.endUndoGroup();
       }
-      alert(makeDebugMessage(detection, marks, debugName), "Frame Plucker");
+      alert(makeDebugMessage(detection, marks, debugName, includeRawCandidates), "Frame Plucker");
       return;
     }
 
@@ -1408,55 +1738,67 @@
         : buildKeepFramesFromDupList(visibleFrameCount, detection.dupFrames, srcStartFrame));
     if (keepFrames.length < 2) fail("Detected cadence removes too many frames.");
 
+    var cleanNameBase;
+    if (detection.mode === "drift") {
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_driftg" + detection.medianGap;
+    } else if (detection.mode === "scattered") {
+      var scatterCount = detection.verifiedDupFrames ? detection.verifiedDupFrames.length : detection.dupFrames.length;
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_pluck" + scatterCount;
+    } else {
+      var phaseLabel = phasesToText(detection.phases).replace(/,/g, "-");
+      cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_p" + detection.period + "_phase" + phaseLabel;
+    }
+    var cleanName = uniqueCompName(cleanNameBase);
+    var removedFrameCount = visibleFrameCount - keepFrames.length;
+    var summary = makeDetectionSummary(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+    var resultMessage = makeResultAlertMessage(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
+
     app.beginUndoGroup("Frame Plucker");
     try {
-      var cleanDuration = keepFrames.length / fps;
-      var cleanNameBase;
-      if (detection.mode === "drift") {
-        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_driftg" + detection.medianGap;
-      } else if (detection.mode === "scattered") {
-        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_pluck" + detection.dupFrames.length;
-      } else {
-        var phaseLabel = phasesToText(detection.phases).replace(/,/g, "-");
-        cleanNameBase = sourceRef.baseName + "_ffmpeg_clean_p" + detection.period + "_phase" + phaseLabel;
-      }
-      var cleanName = uniqueCompName(cleanNameBase);
-      var cleanComp = app.project.items.addComp(
-        cleanName,
-        sourceRef.width,
-        sourceRef.height,
-        sourceRef.pixelAspect,
-        cleanDuration,
-        fps
-      );
-      cleanComp.bgColor = sourceRef.bgColor;
-
-      var cleanLayer = cleanComp.layers.add(sourceRef.source);
-      cleanLayer.name = sourceRef.name + " ffmpeg cadence clean";
-      cleanLayer.startTime = 0;
-      cleanLayer.inPoint = 0;
-      cleanLayer.outPoint = cleanDuration;
-      cleanLayer.audioEnabled = false;
-      cleanLayer.timeRemapEnabled = true;
-
-      var remap = cleanLayer.property("ADBE Time Remapping");
-      for (var i = 0; i < keepFrames.length; i++) {
-        remap.setValueAtTime(i / fps, getOriginalSourceTime(sourceRef, keepFrames[i], fps));
-      }
-      remap.setValueAtTime(cleanDuration, getOriginalSourceTime(sourceRef, keepFrames[keepFrames.length - 1], fps));
-      setHoldKeys(remap);
-
-      var removedFrameCount = visibleFrameCount - keepFrames.length;
-      var summary = makeDetectionSummary(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
-      var resultMessage = makeResultAlertMessage(cleanName, fps, detection, removedFrameCount, visibleFrameCount);
-      var marker = new MarkerValue(summary);
-      cleanComp.markerProperty.setValueAtTime(0, marker);
-      cleanComp.openInViewer();
+      createCleanComp(sourceRef, fps, keepFrames, cleanName, sourceRef.name + " ffmpeg cadence clean", summary);
     } finally {
       app.endUndoGroup();
     }
-
     alert(resultMessage, "Frame Plucker");
+  }
+
+  function runPluckMarkedFrames(allowOtherFrameRates) {
+    var marked = resolveMarkedLayerSourceRef();
+    var sourceRef = marked.sourceRef;
+    validateSourceRef(sourceRef);
+    var fps = getSourceFrameRate(sourceRef);
+    validateRunFrameRate(fps, allowOtherFrameRates);
+
+    var visibleFrameCount = getVisibleFrameCount(sourceRef, fps);
+    var exactSrcStartFrame = getOriginalSourceTime(sourceRef, 0, fps) * fps;
+    var srcStartFrame = Math.round(exactSrcStartFrame);
+    if (Math.abs(exactSrcStartFrame - srcStartFrame) > 0.01) {
+      fail("The selected layer starts between source frames. Align its in point to a source frame before plucking markers.");
+    }
+
+    var sourceFrames = collectMarkedSourceFrames(sourceRef, marked.markerProp, fps, srcStartFrame, visibleFrameCount);
+    var proceed = confirm(
+      "Remove exactly " + sourceFrames.length + " marked source frame(s)?\n\n" +
+      "Every layer marker on the selected layer will be treated as a removal. Detection and ffmpeg will not run.",
+      true,
+      "Frame Plucker"
+    );
+    if (!proceed) return;
+
+    var keepFrames = buildKeepFramesFromSourceList(visibleFrameCount, sourceFrames, srcStartFrame);
+    if (keepFrames.length < 2) fail("The markers remove too many frames.");
+
+    var cleanName = uniqueCompName(sourceRef.baseName + "_marked_clean_" + sourceFrames.length);
+    var summary = "Created " + cleanName + " from " + sourceFrames.length +
+      " manually marked source frame removal(s). Source: " + sourceRef.name + ".";
+    app.beginUndoGroup("Frame Plucker - Marked Frames");
+    try {
+      createCleanComp(sourceRef, fps, keepFrames, cleanName, sourceRef.name + " marked-frame clean", summary);
+    } finally {
+      app.endUndoGroup();
+    }
+    alert("Clean comp created:\n" + cleanName + "\n\nRemoved exactly " + sourceFrames.length +
+      " marked frame(s) from " + visibleFrameCount + ".", "Frame Plucker");
   }
 
   function buildPanel(rootObj) {
@@ -1470,20 +1812,28 @@
     panel.margins = 12;
 
     var hint = panel.add("statictext", undefined,
-      "Select a video in the Project panel (or its layer in a comp), then pluck.",
+      "Select a video to detect holds, or select a marked timeline layer to pluck its markers.",
       { multiline: true });
     hint.preferredSize.height = 34;
 
     var pluckButton = panel.add("button", undefined, "Pluck Frames");
+    var pluckMarkedButton = panel.add("button", undefined, "Pluck Marked Frames");
     var verifyCheck = panel.add("checkbox", undefined, "Verify candidates at full resolution");
     verifyCheck.value = true;
     verifyCheck.helpTip = "Runs a slower second pass only when the fast scan finds frames to remove. Recommended for catching slow motion that resembles a hold.";
+    var allowOtherFpsCheck = panel.add("checkbox", undefined, "Allow non-24 fps sources");
+    allowOtherFpsCheck.value = false;
+    allowOtherFpsCheck.helpTip = "Advanced: allow detection or marked-frame removal at other frame rates. Removing conversion duplicates can shorten and accelerate the result.";
     var debugCheck = panel.add("checkbox", undefined, "Debug: mark frames, don't remove");
     debugCheck.helpTip = "Build a comp of the untouched source with a marker on every frame that would be removed, so you can step through and check each one.";
+    var rawCandidatesCheck = panel.add("checkbox", undefined, "Diagnostic: include rejected raw candidates");
+    rawCandidatesCheck.value = false;
+    rawCandidatesCheck.helpTip = "In debug mode, mark the low-resolution candidate set instead of accepted removals. These are not proposed removals.";
     pluckButton.onClick = function () {
       pluckButton.enabled = false;
+      pluckMarkedButton.enabled = false;
       try {
-        runPluck(debugCheck.value, verifyCheck.value);
+        runPluck(debugCheck.value, verifyCheck.value, rawCandidatesCheck.value, allowOtherFpsCheck.value);
       } catch (err) {
         // fail() already alerted before throwing; only surface unexpected errors.
         if (!(err && err.framePluckerHandled)) {
@@ -1491,6 +1841,21 @@
         }
       } finally {
         pluckButton.enabled = true;
+        pluckMarkedButton.enabled = true;
+      }
+    };
+    pluckMarkedButton.onClick = function () {
+      pluckButton.enabled = false;
+      pluckMarkedButton.enabled = false;
+      try {
+        runPluckMarkedFrames(allowOtherFpsCheck.value);
+      } catch (err) {
+        if (!(err && err.framePluckerHandled)) {
+          alert("Something went wrong:\n" + ((err && err.message) ? err.message : String(err)), "Frame Plucker");
+        }
+      } finally {
+        pluckButton.enabled = true;
+        pluckMarkedButton.enabled = true;
       }
     };
 
