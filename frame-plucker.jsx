@@ -934,10 +934,21 @@
   }
 
   function commandWorks(command) {
+    var outputFile = makeTempFile("ffmpeg_version");
     try {
-      var output = callSystemCommand(aeShellQuote(command) + " -version");
+      // AE on Windows can return an empty string from system.callSystem() even
+      // when the child process ran successfully. Capture through a file, as the
+      // analysis probes do, so PATH and manually selected executables are
+      // validated from ffmpeg's actual output.
+      callSystemCommand(
+        aeShellQuote(command) + " -version" +
+        " 1>" + aeShellQuote(outputFile.fsName) +
+        " 2>&1"
+      );
+      var output = readAndRemove(outputFile);
       return lowerText(output).match(/ffmpeg version/) !== null;
     } catch (err) {
+      readAndRemove(outputFile);
       return false;
     }
   }
