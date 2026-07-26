@@ -21,5 +21,5 @@ Select a video or video layer, then click **Pluck Frames**.
 
 ## ffmpeg
 
-Frame Plucker requires [ffmpeg](https://ffmpeg.org/download.html). If it is not
-detected automatically, Frame Plucker asks you to locate the executable.
+Frame Plucker requires [ffmpeg](https://ffmpeg.org/download.html). On Windows,
+add `ffmpeg.exe` to PATH or select it when Frame Plucker asks.
