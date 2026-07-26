@@ -5,7 +5,6 @@
   var HARD_CAP = 1500;
   var SETTINGS_SECTION = "FramePlucker";
   var SETTINGS_FFMPEG_PATH = "ffmpegPath";
-  var MANAGED_DIR_NAME = "Frame Plucker";
 
 // === CORE BEGIN ===
   var MIN_PHASE_SAMPLES = 6;
@@ -933,96 +932,7 @@
     }
   }
 
-  function scriptFolder() {
-    try {
-      if ($.fileName) return new File($.fileName).parent;
-    } catch (err) {}
-    return null;
-  }
-
-  function bundledLeafName() {
-    return isWindows() ? "ffmpeg.exe" : "ffmpeg";
-  }
-
-  function bundledRelDir() {
-    return isWindows() ? "win" : "mac";
-  }
-
-  function managedBinFolder() {
-    return new Folder(Folder.userData.fsName + "/" + MANAGED_DIR_NAME + "/bin");
-  }
-
-  function managedFfmpegFile() {
-    return new File(managedBinFolder().fsName + "/" + bundledLeafName());
-  }
-
-  function findBundledSourceFile(baseFolder) {
-    if (!baseFolder) return null;
-    try {
-      var f = new File(baseFolder.fsName + "/bin/" + bundledRelDir() + "/" + bundledLeafName());
-      if (f.exists) return f;
-    } catch (err) {}
-    return null;
-  }
-
-  function prepareMacBinary(file) {
-    // Bundled binaries lose their executable bit through some zip/copy paths, and
-    // a browser download tags them com.apple.quarantine, which Gatekeeper uses to
-    // kill an unsigned exec launched from a shell. Fix both once, in place. These
-    // calls emit almost no output, so they are not exposed to the callSystem
-    // pipe-buffer freeze.
-    if (!isMac()) return;
-    var quoted = aeShellQuote(file.fsName);
-    try { system.callSystem("/bin/chmod 755 " + quoted); } catch (err) {}
-    try { system.callSystem("/usr/bin/xattr -d com.apple.quarantine " + quoted + " 2>/dev/null"); } catch (err2) {}
-  }
-
-  function provisionFromSource(srcFile) {
-    // Copy the bundled binary into a user-writable managed dir (no admin needed),
-    // fix mac perms/quarantine there, and verify it runs before trusting it.
-    if (!srcFile || !srcFile.exists) return null;
-    try {
-      var destFolder = managedBinFolder();
-      if (!destFolder.exists) {
-        // Create the parent chain explicitly; Folder.create() is not reliably
-        // recursive across ExtendScript versions.
-        var parent = destFolder.parent;
-        if (parent && !parent.exists) parent.create();
-        destFolder.create();
-        if (!destFolder.exists) return null;
-      }
-      var dest = managedFfmpegFile();
-      if (!dest.exists) {
-        if (!srcFile.copy(dest.fsName)) return null;
-      }
-      prepareMacBinary(dest);
-      if (commandWorks(dest.fsName)) return dest.fsName;
-    } catch (err) {}
-    return null;
-  }
-
-  function resolveBundledFfmpeg(allowPrompt) {
-    // 1. Already provisioned into the managed dir (fast path after first run).
-    var managed = managedFfmpegFile();
-    if (managed.exists && commandWorks(managed.fsName)) return managed.fsName;
-
-    // 2. Bundled next to this script (folder-drop install or run-from-package).
-    var fromScript = provisionFromSource(findBundledSourceFile(scriptFolder()));
-    if (fromScript) return fromScript;
-
-    // 3. As a last resort, ask the user once to point at the unzipped folder.
-    if (allowPrompt) {
-      var picked = Folder.selectDialog("Select the Frame Plucker folder you unzipped");
-      if (picked) {
-        var fromPicked = provisionFromSource(findBundledSourceFile(picked));
-        if (fromPicked) return fromPicked;
-      }
-    }
-    return null;
-  }
-
   function findDefaultFfmpegPath() {
-    // Respect an ffmpeg the user already has before falling back to our bundle.
     if (commandWorks("ffmpeg")) return "ffmpeg";
 
     var candidates = isMac()
@@ -1037,11 +947,6 @@
         if (candidate.exists && commandWorks(candidate.fsName)) return candidate.fsName;
       } catch (err) {}
     }
-
-    // No user-supplied ffmpeg: fall back to the bundled binary (no prompt here;
-    // the prompt-based recovery lives in analyzeSourceWithFfmpeg).
-    var bundled = resolveBundledFfmpeg(false);
-    if (bundled) return bundled;
 
     return "ffmpeg";
   }
@@ -1525,10 +1430,9 @@
 
   function getRunFfmpegPath() {
     // PATH always wins, on every run and on both Mac and Windows: a pro user's
-    // own ffmpeg is never shadowed by a cached bundle, and if they install
-    // ffmpeg later we pick it up automatically. This probe is at pluck time, not
-    // script load, so the panel still opens instantly. Users with no ffmpeg on
-    // PATH fall through to the cached/common/bundled resolution below.
+    // own ffmpeg is preferred over a cached manually selected path, and if they
+    // install ffmpeg later we pick it up automatically. This probe is at pluck
+    // time, so the panel still opens instantly.
     if (commandWorks("ffmpeg")) return "ffmpeg";
     var cached = getCachedFfmpegPath();
     if (cached && commandWorks(cached)) return cached;
@@ -1551,17 +1455,6 @@
 
     if (isNotFoundOutput(output)) {
       clearCachedFfmpegPath();
-      // Try the bundled engine first (may prompt once for the unzipped folder),
-      // so users without ffmpeg never need to hunt for an executable.
-      var bundledPath = resolveBundledFfmpeg(true);
-      if (bundledPath) {
-        var bundledOutput = runFfmpegDiffProbe(sourceRef.file, bundledPath, frameLimit);
-        var bundledMetrics = parseDiffMetrics(bundledOutput);
-        if (metricsCoverExpectedProbe(bundledMetrics, frameLimit)) {
-          saveCachedFfmpegPath(bundledPath);
-          return { metrics: bundledMetrics, ffmpegPath: bundledPath };
-        }
-      }
       var file = File.openDialog("Locate the ffmpeg executable");
       if (file) {
         var retryPath = file.fsName;
